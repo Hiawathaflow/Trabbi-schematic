@@ -42,6 +42,7 @@ class Sheet:
         self.sym_defs = {}      # lib_id -> {pin_name: pin_number}
         self.hier_sheets = []   # hierarchical sheet blocks (root only)
         self._sym_local_pins = {}  # lib_id -> {pin_name: (local_x, local_y)}
+        self._sym_dims = {}       # lib_id -> (w, h)
         self._placements = {}     # ref -> (lib_id, x, y, ang)
 
     # -- UID helper --------------------------------------------------------
@@ -51,11 +52,11 @@ class Sheet:
 
     # -- Pin line helper ---------------------------------------------------
     @staticmethod
-    def _pin_line(name, num, ptype, x, y, ang, plen=2.54):
+    def _pin_line(name, num, ptype, x, y, ang, plen=3.81):
         return (
             f'        (pin {ptype} line (at {x:.3f} {y:.3f} {ang}) (length {plen:.3f})\n'
-            f'          (name "{name}" (effects (font (size 1.016 1.016))))\n'
-            f'          (number "{num}" (effects (font (size 1.016 1.016))))\n'
+            f'          (name "{name}" (effects (font (size 0.762 0.762))))\n'
+            f'          (number "{num}" (effects (font (size 0.762 0.762)) hide))\n'
             f'        )'
         )
 
@@ -68,7 +69,7 @@ class Sheet:
         (added inside the _0_1 sub-symbol)."""
         name = lib_id.split(":")[-1]
         hw2, hh = w / 2, h / 2
-        pl = 2.54
+        pl = 3.81
         pin_map = {}
         n = [1]
 
@@ -139,6 +140,7 @@ class Sheet:
         self.lib_syms.extend(s)
         self.sym_defs[lib_id] = pin_map
         self._sym_local_pins[lib_id] = pin_local
+        self._sym_dims[lib_id] = (w, h)
         return lib_id, pin_map
 
     # -- Place component instance ------------------------------------------
@@ -146,15 +148,20 @@ class Sheet:
         x, y = self._g(x), self._g(y)
         self._placements[ref] = (lib_id, x, y, ang)
         pm = self.sym_defs.get(lib_id, {})
+        # Position Ref above body, Value below body
+        _w, _h = self._sym_dims.get(lib_id, (20, 16))
+        hh = _h / 2
+        ref_dy = -(hh + 3)   # above top edge
+        val_dy = hh + 3      # below bottom edge
         s = []
         s.append(f'  (symbol (lib_id "{lib_id}") (at {x:.3f} {y:.3f} {ang})')
         s.append(f'    (unit 1) (in_bom yes) (on_board yes) (dnp no)')
         s.append(f'    (uuid "{self.uid()}")')
         for prop, pval, dx, dy in [
-            ("Reference", ref,  0, -8),
-            ("Value",     val,  0,  8),
-            ("Footprint", "",   0,  0),
-            ("Datasheet", "",   0,  0),
+            ("Reference", ref,  0, ref_dy),
+            ("Value",     val,  0, val_dy),
+            ("Footprint", "",   0, 0),
+            ("Datasheet", "",   0, 0),
         ]:
             hide = " hide" if prop in ("Footprint", "Datasheet") else ""
             s.append(f'    (property "{prop}" "{pval}" (at {x + dx:.3f} {y + dy:.3f} 0)')
