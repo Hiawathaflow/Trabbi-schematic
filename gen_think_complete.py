@@ -231,7 +231,7 @@ class Sheet:
         x, y = self._g(x), self._g(y)
         self.elems.append(
             f'  (label "{name}" (at {x:.3f} {y:.3f} {ang})\n'
-            f'    (effects (font (size 1.27 1.27)) (justify left))\n'
+            f'    (effects (font (size 1.27 1.27)))\n'
             f'    (uuid "{self.uid()}")\n'
             f'  )'
         )
@@ -242,7 +242,7 @@ class Sheet:
         u = self.uid()
         self.elems.append(
             f'  (global_label "{name}" (shape {shape}) (at {x:.3f} {y:.3f} {ang})\n'
-            f'    (effects (font (size 1.27 1.27)) (justify left))\n'
+            f'    (effects (font (size 1.27 1.27)))\n'
             f'    (uuid "{u}")\n'
             f'    (property "Intersheetrefs" "${{INTERSHEET_REFS}}" (at {x:.3f} {y:.3f} 0)\n'
             f'      (effects (font (size 1.27 1.27)) hide)\n'
@@ -1724,10 +1724,32 @@ def build_s09_signals_horn():
     def_switch(sh)
     def_relay_spst(sh)
 
-    sh.defsym("Think:FLASHER_RELAY", 18, 16,
+    # Flasher relay — same coil+switch graphics as standard relay
+    _fw, _fh = 18, 16
+    _fhw2 = _fw / 2
+    # 2 left pins on h=16: sp=5.33, y≈2.54, -2.54
+    _f_ct, _f_cb = 2.54, -2.54
+    # 1 right pin on h=16: sp=8, y=0
+    _f_com = 0.0
+    _f_gfx = []
+    _f_cx = -_fhw2 / 2
+    _f_gfx.append(_gfx_polyline([(-_fhw2, _f_ct), (_f_cx, _f_ct)]))
+    _f_gfx.append(_gfx_polyline([(-_fhw2, _f_cb), (_f_cx, _f_cb)]))
+    for _fi in range(4):
+        _fys = _f_ct - _fi * (_f_ct - _f_cb) / 4
+        _fye = _f_ct - (_fi + 1) * (_f_ct - _f_cb) / 4
+        _fym = (_fys + _fye) / 2
+        _fxm = _f_cx + (1.5 if _fi % 2 == 0 else -1.5)
+        _f_gfx.append(_gfx_arc(_f_cx, _fys, _fxm, _fym, _f_cx, _fye))
+    _f_sx = _fhw2 / 2
+    _f_r = 0.6
+    _f_gfx.append(_gfx_polyline([(_fhw2, _f_com), (_f_sx + _f_r, _f_com)]))
+    _f_gfx.append(_gfx_circle(_f_sx, _f_com, _f_r))
+    _f_gfx.append(_gfx_polyline([(0, -_fh/2 - 1), (0, _fh/2 + 1)], stroke="dash"))
+    sh.defsym("Think:FLASHER_RELAY", _fw, _fh,
         lpins=["49_IN", "31_GND"],
         rpins=["49a_OUT"],
-        body_label="FLASHER\\nRELAY\\n(R3)", ref_pfx="K")
+        body_label="FLASHER", ref_pfx="K", body_gfx=_f_gfx)
 
     sh.defsym("Think:TURN_SIG_SW", 20, 24,
         lpins=["IN"],
