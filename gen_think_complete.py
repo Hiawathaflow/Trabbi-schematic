@@ -62,8 +62,10 @@ class Sheet:
     # -- Symbol definition -------------------------------------------------
     def defsym(self, lib_id, w, h,
                lpins=(), rpins=(), tpins=(), bpins=(),
-               body_label="", ref_pfx="U"):
-        """Define a schematic symbol and register its pin map."""
+               body_label="", ref_pfx="U", body_gfx=()):
+        """Define a schematic symbol and register its pin map.
+        body_gfx: optional list of S-expression strings for body graphics
+        (added inside the _0_1 sub-symbol)."""
         name = lib_id.split(":")[-1]
         hw2, hh = w / 2, h / 2
         pl = 2.54
@@ -97,6 +99,8 @@ class Sheet:
                 s.append(f'        (text "{line}" (at 0 {-i * 3:.1f} 0)')
                 s.append(f'          (effects (font (size 1.4 1.4) bold))')
                 s.append(f'        )')
+        for gline in body_gfx:
+            s.append(gline)
         s.append(f'      )')
         s.append(f'      (symbol "{name}_1_1"')
 
@@ -325,17 +329,98 @@ def def_fuse(sh):
     return sh.defsym("Think:FUSE", 14, 8,
         lpins=["A"], rpins=["B"], body_label="FUSE", ref_pfx="F")
 
+def _gfx_polyline(pts, stroke="default"):
+    xy = " ".join(f"(xy {x:.2f} {y:.2f})" for x, y in pts)
+    return (
+        f'        (polyline (pts {xy})\n'
+        f'          (stroke (width 0.254) (type {stroke}))\n'
+        f'          (fill (type none))\n'
+        f'        )'
+    )
+
+def _gfx_arc(sx, sy, mx, my, ex, ey):
+    return (
+        f'        (arc (start {sx:.2f} {sy:.2f}) (mid {mx:.2f} {my:.2f}) (end {ex:.2f} {ey:.2f})\n'
+        f'          (stroke (width 0.254) (type default))\n'
+        f'          (fill (type none))\n'
+        f'        )'
+    )
+
+def _gfx_circle(cx, cy, r):
+    return (
+        f'        (circle (center {cx:.2f} {cy:.2f}) (radius {r:.2f})\n'
+        f'          (stroke (width 0.254) (type default))\n'
+        f'          (fill (type none))\n'
+        f'        )'
+    )
+
+def _relay_gfx(hw2, coil_top, coil_bot, com_y, no_y, nc_y=None):
+    """Build relay body graphics: coil (left) + switch contacts (right)."""
+    gfx = []
+    # -- Coil (left half) --
+    cx = -hw2 / 2  # coil center x
+    # Connecting lines from body edge to coil
+    gfx.append(_gfx_polyline([(-hw2, coil_top), (cx, coil_top)]))
+    gfx.append(_gfx_polyline([(-hw2, coil_bot), (cx, coil_bot)]))
+    # 4 arcs (inductor humps)
+    n_arcs = 4
+    bump_h = (coil_top - coil_bot) / n_arcs
+    for i in range(n_arcs):
+        ys = coil_top - i * bump_h
+        ye = coil_top - (i + 1) * bump_h
+        ym = (ys + ye) / 2
+        xm = cx + (1.5 if i % 2 == 0 else -1.5)
+        gfx.append(_gfx_arc(cx, ys, xm, ym, cx, ye))
+
+    # -- Switch contacts (right half) --
+    sx = hw2 / 2  # switch center x
+    r = 0.6
+    # Connecting lines from body edge to contacts
+    gfx.append(_gfx_polyline([(hw2, com_y), (sx + r, com_y)]))
+    gfx.append(_gfx_polyline([(hw2, no_y), (sx + r, no_y)]))
+    if nc_y is not None:
+        gfx.append(_gfx_polyline([(hw2, nc_y), (sx + r, nc_y)]))
+    # Contact circles
+    gfx.append(_gfx_circle(sx, com_y, r))
+    gfx.append(_gfx_circle(sx, no_y, r))
+    if nc_y is not None:
+        gfx.append(_gfx_circle(sx, nc_y, r))
+    # Arm (open contact) — from COM toward NO, not quite reaching
+    arm_end_y = com_y + (no_y - com_y) * 0.75
+    gfx.append(_gfx_polyline([(sx, com_y - r), (sx + 1.5, arm_end_y)]))
+    # Separator line (dashed) between coil and switch
+    hh = max(abs(coil_top), abs(coil_bot), abs(com_y), abs(no_y))
+    if nc_y is not None:
+        hh = max(hh, abs(nc_y))
+    gfx.append(_gfx_polyline([(0, -hh - 1), (0, hh + 1)], stroke="dash"))
+    return gfx
+
+
 def def_relay_spdt(sh):
-    return sh.defsym("Think:RELAY_SPDT", 20, 30,
+    w, h = 20, 30
+    hw2 = w / 2  # 10
+    # Left pins (coil): 2 pins on h=30 → sp=10 → y = 5, -5 → snapped 5.08, -5.08
+    coil_top, coil_bot = 5.08, -5.08
+    # Right pins (switch): 3 pins on h=30 → sp=7.5 → y = 7.5, 0, -7.5 → snapped 7.62, 0, -7.62
+    com_y, no_y, nc_y = 7.62, 0.0, -7.62
+    gfx = _relay_gfx(hw2, coil_top, coil_bot, com_y, no_y, nc_y)
+    return sh.defsym("Think:RELAY_SPDT", w, h,
         lpins=["86_COIL+", "85_COIL-"],
         rpins=["30_COM", ("87_NO", "output"), ("87a_NC", "output")],
-        body_label="RELAY", ref_pfx="K")
+        body_label="", ref_pfx="K", body_gfx=gfx)
 
 def def_relay_spst(sh):
-    return sh.defsym("Think:RELAY_SPST", 18, 16,
+    w, h = 18, 16
+    hw2 = w / 2  # 9
+    # Left pins (coil): 2 pins on h=16 → sp=5.33 → y = 2.67, -2.67 → snapped 2.54, -2.54
+    coil_top, coil_bot = 2.54, -2.54
+    # Right pins (switch): 2 pins on h=16 → sp=5.33 → y = 2.67, -2.67 → snapped 2.54, -2.54
+    com_y, no_y = 2.54, -2.54
+    gfx = _relay_gfx(hw2, coil_top, coil_bot, com_y, no_y)
+    return sh.defsym("Think:RELAY_SPST", w, h,
         lpins=["86_COIL+", "85_COIL-"],
         rpins=["30_COM", ("87_NO", "output")],
-        body_label="RELAY", ref_pfx="K")
+        body_label="", ref_pfx="K", body_gfx=gfx)
 
 def def_switch(sh):
     return sh.defsym("Think:SW_SPST", 14, 8,
@@ -468,7 +553,7 @@ def build_s01_power_dist():
         sh.wire(sx, sy, ROUTE_X, sy)
         sh.wire(ROUTE_X, sy, ROUTE_X, fy)
         sh.wire(ROUTE_X, fy, fx, fy)
-        sh.label(sx + 4, sy, lbl_text)
+        sh.label(sx + 10, sy, lbl_text)
         ROUTE_X += 8  # offset each route to avoid overlaps
     sh.text(80, sh.p("SW1", "ACC_RUN")[1] - 4, "Wire: 6mm2 YEL", 1.0)
 
@@ -640,7 +725,7 @@ def build_s02_hv_power():
     sh.wire(*fh_b, 100, fh_b[1])
     sh.wire(100, fh_b[1], 100, cb_pv[1])
     sh.wire(100, cb_pv[1], *cb_pv)
-    sh.label(fh_b[0] + 3, fh_b[1], "+114V_FUSED")
+    sh.label(fh_b[0] + 10, fh_b[1], "+114V_FUSED")
 
     # Battery- → Contactor Box -114V_IN
     bt_neg = sh.p("BT1", "-")
@@ -649,7 +734,7 @@ def build_s02_hv_power():
     sh.wire(bt_neg[0], bt_neg[1] + 19, 100, bt_neg[1] + 19)
     sh.wire(100, bt_neg[1] + 19, 100, cb_nv[1])
     sh.wire(100, cb_nv[1], *cb_nv)
-    sh.label(BT_X + 5, bt_neg[1] + 19, "-114V")
+    sh.label(BT_X + 10, bt_neg[1] + 19, "-114V")
 
     # Contactor Box → Motor Controller HV
     cb_pout = sh.p("U1", "+114V_OUT")
@@ -658,8 +743,8 @@ def build_s02_hv_power():
     mc_nv = sh.p("U2", "-114V")
     sh.wire_l(*cb_pout, *mc_pv)
     sh.wire_l(*cb_nout, *mc_nv)
-    sh.label(cb_pout[0] + 3, cb_pout[1], "+114V_TO_MC")
-    sh.label(cb_nout[0] + 3, cb_nout[1], "-114V_TO_MC")
+    sh.label(cb_pout[0] + 10, cb_pout[1], "+114V_TO_MC")
+    sh.label(cb_nout[0] + 10, cb_nout[1], "-114V_TO_MC")
 
     # Motor Controller → Motor L1/L2/L3
     for lbl in ["L1", "L2", "L3"]:
@@ -667,7 +752,7 @@ def build_s02_hv_power():
         mmx, mmy = sh.p("M1", lbl)
         sh.wire(mcx, mcy, mcx + 13, mcy)
         sh.wire_l(mcx + 13, mcy, mmx, mmy)
-        sh.label(mcx + 3, mcy, lbl)
+        sh.label(mcx + 10, mcy, lbl)
 
     # Motor PE
     pe = sh.p("M1", "PE")
@@ -1017,7 +1102,7 @@ def build_s05_regen_dcdc():
     sh.wire(f1_a[0], hvdb_dcdc_p[1], *f1_a)
     sh.wire(*f1_b, dcdc_pv[0], f1_b[1])
     sh.wire(dcdc_pv[0], f1_b[1], *dcdc_pv)
-    sh.label(f1_b[0] + 3, f1_b[1], "+114V_DCDC")
+    sh.label(f1_b[0] + 10, f1_b[1], "+114V_DCDC")
 
     # HV Distribution -114V_DCDC → DC/DC -114V_IN
     hvdb_dcdc_n = sh.p("U2", "-114V_DCDC")
@@ -1412,13 +1497,13 @@ def build_s07_headlights():
 
     # Fuse power globals on bulb + pins
     ds1_pp = sh.p("DS1", "+")
-    sh.glabel(ds1_pp[0] - 5, ds1_pp[1], "+12V_F16_PARK_FRT", 180)
+    sh.glabel(ds1_pp[0] - 12, ds1_pp[1], "+12V_F16_PARK_FRT", 180)
     ds3_pp = sh.p("DS3", "+")
-    sh.glabel(ds3_pp[0] - 5, ds3_pp[1], "+12V_F27_LOBEAML", 180)
+    sh.glabel(ds3_pp[0] - 12, ds3_pp[1], "+12V_F27_LOBEAML", 180)
     ds4_pp = sh.p("DS4", "+")
-    sh.glabel(ds4_pp[0] - 5, ds4_pp[1], "+12V_F26_LOBEAMR", 180)
+    sh.glabel(ds4_pp[0] - 12, ds4_pp[1], "+12V_F26_LOBEAMR", 180)
     ds5_pp = sh.p("DS5", "+")
-    sh.glabel(ds5_pp[0] - 5, ds5_pp[1], "+12V_F25_HIBEAMR", 180)
+    sh.glabel(ds5_pp[0] - 12, ds5_pp[1], "+12V_F25_HIBEAMR", 180)
 
     # Collision lamp
     ds9_p = sh.p("DS9", "+")
@@ -1737,8 +1822,10 @@ def build_s09_signals_horn():
         sh.glabel(nx + 15, ny, "GND", 0, "input")
 
     # Global labels for turn signal rear (cross-sheet with S08)
-    sh.glabel(ds5_p[0], ds5_p[1], "TURN_SIG_LH_REAR", 180)
-    sh.glabel(ds6_p[0], ds6_p[1], "TURN_SIG_RH_REAR", 180)
+    sh.wire(*ds5_p, ds5_p[0] - 16, ds5_p[1])
+    sh.glabel(ds5_p[0] - 16, ds5_p[1], "TURN_SIG_LH_REAR", 180)
+    sh.wire(*ds6_p, ds6_p[0] - 16, ds6_p[1])
+    sh.glabel(ds6_p[0] - 16, ds6_p[1], "TURN_SIG_RH_REAR", 180)
 
     # Dome light
     dl_p = sh.p("DS7", "+")
