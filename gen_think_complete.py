@@ -11,6 +11,7 @@ Output: 14 .kicad_sch files in Data/Trabbi Schematic/
 
 import uuid
 import os
+import math
 
 # ---------------------------------------------------------------------------
 # Output directory
@@ -37,6 +38,8 @@ class Sheet:
         self.elems = []         # top-level elements (symbols, wires, labels, ...)
         self.sym_defs = {}      # lib_id -> {pin_name: pin_number}
         self.hier_sheets = []   # hierarchical sheet blocks (root only)
+        self._sym_local_pins = {}  # lib_id -> {pin_name: (local_x, local_y)}
+        self._placements = {}     # ref -> (lib_id, x, y, ang)
 
     # -- UID helper --------------------------------------------------------
     @staticmethod
@@ -94,6 +97,8 @@ class Sheet:
         s.append(f'      )')
         s.append(f'      (symbol "{name}_1_1"')
 
+        pin_local = {}
+
         def add_side(pins, side, body_dim):
             np2 = len(pins)
             if not np2:
@@ -112,6 +117,7 @@ class Sheet:
                     px, py, ang = pos, -hh - pl, 90
                 s.append(self._pin_line(pname, n[0], ptype, px, py, ang, pl))
                 pin_map[pname] = str(n[0])
+                pin_local[pname] = (px, py)
                 n[0] += 1
 
         add_side(lpins, 'L', h)
@@ -123,10 +129,12 @@ class Sheet:
 
         self.lib_syms.extend(s)
         self.sym_defs[lib_id] = pin_map
+        self._sym_local_pins[lib_id] = pin_local
         return lib_id, pin_map
 
     # -- Place component instance ------------------------------------------
     def place(self, lib_id, ref, val, x, y, ang=0):
+        self._placements[ref] = (lib_id, x, y, ang)
         pm = self.sym_defs.get(lib_id, {})
         s = []
         s.append(f'  (symbol (lib_id "{lib_id}") (at {x:.3f} {y:.3f} {ang})')
@@ -146,6 +154,24 @@ class Sheet:
             s.append(f'    (pin "{pnum}" (uuid "{self.uid()}"))')
         s.append(f'  )')
         self.elems.extend(s)
+
+    # -- Pin position lookup ------------------------------------------------
+    def p(self, ref, pin_name):
+        """Return exact schematic (x, y) of the connection point of a pin."""
+        lib_id, sx, sy, ang = self._placements[ref]
+        lx, ly = self._sym_local_pins[lib_id][pin_name]
+        if ang == 0:
+            return (sx + lx, sy - ly)
+        elif ang == 90:
+            return (sx - ly, sy - lx)
+        elif ang == 180:
+            return (sx - lx, sy + ly)
+        elif ang == 270:
+            return (sx + ly, sy + lx)
+        else:
+            rad = math.radians(ang)
+            c, s = math.cos(rad), math.sin(rad)
+            return (sx + lx * c - ly * s, sy - lx * s - ly * c)
 
     # -- Wire --------------------------------------------------------------
     def wire(self, x1, y1, x2, y2):
@@ -314,10 +340,12 @@ def place_fuse_row(sh, fuse_id, fuses_info, start_x, start_y, dx=0, dy=18):
         x = start_x + i * dx
         y = start_y + i * dy
         sh.place(fuse_id, ref, val, x, y)
-        sh.wire(x - 9, y, x - 16, y)
-        sh.wire(x + 9, y, x + 16, y)
-        sh.glabel(x - 16, y, lbl + "_IN", 180)
-        sh.glabel(x + 16, y, lbl, 0)
+        ax, ay = sh.p(ref, "A")
+        bx, by = sh.p(ref, "B")
+        sh.wire(ax, ay, ax - 7, ay)
+        sh.wire(bx, by, bx + 7, by)
+        sh.glabel(ax - 7, ay, lbl + "_IN", 180)
+        sh.glabel(bx + 7, by, lbl, 0)
 
 
 # ============================================================================
@@ -376,35 +404,43 @@ def build_s01_power_dist():
     sh.place("Think:FUSE_BOX_C01", "FB1", "Fuse Box C01", FB_X, FB_Y)
 
     # -- Battery to fuse box wiring --
-    sh.wire(BT_X, BT_Y - 12, BT_X, BT_Y - 25)
-    sh.wire(BT_X, BT_Y - 25, 140, BT_Y - 25)
-    sh.wire(140, BT_Y - 25, 140, 75)
-    sh.wire(140, 75, FB_X - 22, 75)
-    sh.text(BT_X + 5, BT_Y - 28, "Wire: 6mm2 RED", 1.0)
-    sh.glabel(BT_X, BT_Y - 25, "+12V_ALWAYS", 180, "output")
+    bt_pos = sh.p("BT1", "+")
+    fb_bat = sh.p("FB1", "+12V_BAT30")
+    sh.wire(*bt_pos, bt_pos[0], bt_pos[1] - 15)
+    sh.wire(bt_pos[0], bt_pos[1] - 15, 140, bt_pos[1] - 15)
+    sh.wire(140, bt_pos[1] - 15, 140, fb_bat[1])
+    sh.wire(140, fb_bat[1], *fb_bat)
+    sh.text(BT_X + 5, bt_pos[1] - 18, "Wire: 6mm2 RED", 1.0)
+    sh.glabel(bt_pos[0], bt_pos[1] - 15, "+12V_ALWAYS", 180, "output")
 
     # Battery GND
-    sh.wire(BT_X, BT_Y + 12, BT_X, BT_Y + 25)
-    sh.glabel(BT_X, BT_Y + 25, "GND", 270, "input")
-    sh.text(BT_X + 5, BT_Y + 20, "Wire: 6mm2 BLK", 1.0)
+    bt_neg = sh.p("BT1", "-")
+    sh.wire(*bt_neg, bt_neg[0], bt_neg[1] + 15)
+    sh.glabel(bt_neg[0], bt_neg[1] + 15, "GND", 270, "input")
+    sh.text(BT_X + 5, bt_neg[1] + 10, "Wire: 6mm2 BLK", 1.0)
 
-    # Ignition switch → fuse box power inputs
-    sh.wire(IGN_X + 14, IGN_Y - 10, FB_X - 22, IGN_Y - 10)
-    sh.label(IGN_X + 18, IGN_Y - 10, "+12V_ACC_RUN (pos 15/2)")
-    sh.text(80, IGN_Y - 14, "Wire: 6mm2 YEL", 1.0)
-
-    sh.wire(IGN_X + 14, IGN_Y - 2, FB_X - 22, IGN_Y - 2)
-    sh.label(IGN_X + 18, IGN_Y - 2, "+12V_IGN (pos 15)")
-
-    sh.wire(IGN_X + 14, IGN_Y + 6, FB_X - 22, IGN_Y + 6)
-    sh.label(IGN_X + 18, IGN_Y + 6, "+12V_RUN_START (pos 15/1)")
-
-    sh.wire(IGN_X + 14, IGN_Y + 14, FB_X - 22, IGN_Y + 14)
-    sh.label(IGN_X + 18, IGN_Y + 14, "+12V_START (pos 50)")
+    # Ignition switch → fuse box power inputs (routed via intermediate X=160)
+    ROUTE_X = 160
+    ign_pairs = [
+        ("ACC_RUN",   "+12V_ACC15_2", "+12V_ACC_RUN (pos 15/2)"),
+        ("DRIVE_OUT", "+12V_IGN15",   "+12V_IGN (pos 15)"),
+        ("RUN_START", "+12V_RUN15_1", "+12V_RUN_START (pos 15/1)"),
+        ("START_OUT", "+12V_START50", "+12V_START (pos 50)"),
+    ]
+    for sw_pin, fb_pin, lbl_text in ign_pairs:
+        sx, sy = sh.p("SW1", sw_pin)
+        fx, fy = sh.p("FB1", fb_pin)
+        sh.wire(sx, sy, ROUTE_X, sy)
+        sh.wire(ROUTE_X, sy, ROUTE_X, fy)
+        sh.wire(ROUTE_X, fy, fx, fy)
+        sh.label(sx + 4, sy, lbl_text)
+        ROUTE_X += 8  # offset each route to avoid overlaps
+    sh.text(80, sh.p("SW1", "ACC_RUN")[1] - 4, "Wire: 6mm2 YEL", 1.0)
 
     # Ignition BAT_IN from battery
-    sh.wire(IGN_X - 14, IGN_Y, IGN_X - 30, IGN_Y)
-    sh.glabel(IGN_X - 30, IGN_Y, "+12V_ALWAYS", 180)
+    bat_in = sh.p("SW1", "BAT_IN")
+    sh.wire(*bat_in, bat_in[0] - 16, bat_in[1])
+    sh.glabel(bat_in[0] - 16, bat_in[1], "+12V_ALWAYS", 180)
 
     # -- Global labels on fuse outputs --
     fuse_globals = [
@@ -443,17 +479,15 @@ def build_s01_power_dist():
         ("F33_10A", "+12V_F33_WEBASTO"),
     ]
 
-    n_fuses = len(fuse_rpins)
-    body_h = 180
-    fuse_sp = body_h / (n_fuses + 1)
-    for i, (fpn, glbl) in enumerate(fuse_globals):
-        fy = FB_Y - body_h / 2 + fuse_sp * (i + 1)
-        sh.wire(FB_X + 22, fy, FB_X + 40, fy)
-        sh.glabel(FB_X + 40, fy, glbl, 0, "output")
+    for fpn, glbl in fuse_globals:
+        fx, fy = sh.p("FB1", fpn)
+        sh.wire(fx, fy, fx + 18, fy)
+        sh.glabel(fx + 18, fy, glbl, 0, "output")
 
     # GND bus at bottom of fuse box
-    sh.wire(FB_X, FB_Y + 92, FB_X, FB_Y + 105)
-    sh.glabel(FB_X, FB_Y + 105, "GND", 270, "input")
+    gx, gy = sh.p("FB1", "GND")
+    sh.wire(gx, gy, gx, gy + 13)
+    sh.glabel(gx, gy + 13, "GND", 270, "input")
 
     # -- Fuse description annotations --
     fuse_descs = [
@@ -559,68 +593,86 @@ def build_s02_hv_power():
 
     # -- Wiring: HV power path --
     # Battery+ → Fuse
-    sh.wire(BT_X, BT_Y - 16, BT_X, FH_Y + 4)
+    bt_pos = sh.p("BT1", "+")
+    fh_a = sh.p("F_HV", "A")
+    sh.wire(*bt_pos, bt_pos[0], fh_a[1])
+    sh.wire(bt_pos[0], fh_a[1], *fh_a)
     sh.text(BT_X + 3, BT_Y - 20, "Wire: HV Orange (35mm2)", 0.9)
 
-    # Fuse → Contactor Box VA
-    sh.wire(FH_X + 9, FH_Y, 100, FH_Y)
-    sh.wire(100, FH_Y, 100, CB_Y - 20)
-    sh.wire(100, CB_Y - 20, CB_X - 22, CB_Y - 20)
-    sh.label(FH_X + 12, FH_Y, "+114V_FUSED")
+    # Fuse → Contactor Box +114V_IN
+    fh_b = sh.p("F_HV", "B")
+    cb_pv = sh.p("U1", "+114V_IN")
+    sh.wire(*fh_b, 100, fh_b[1])
+    sh.wire(100, fh_b[1], 100, cb_pv[1])
+    sh.wire(100, cb_pv[1], *cb_pv)
+    sh.label(fh_b[0] + 3, fh_b[1], "+114V_FUSED")
 
-    # Battery- → Contactor Box VB
-    sh.wire(BT_X, BT_Y + 16, BT_X, BT_Y + 35)
-    sh.wire(BT_X, BT_Y + 35, 100, BT_Y + 35)
-    sh.wire(100, BT_Y + 35, 100, CB_Y - 10)
-    sh.wire(100, CB_Y - 10, CB_X - 22, CB_Y - 10)
-    sh.label(BT_X + 5, BT_Y + 35, "-114V")
+    # Battery- → Contactor Box -114V_IN
+    bt_neg = sh.p("BT1", "-")
+    cb_nv = sh.p("U1", "-114V_IN")
+    sh.wire(*bt_neg, bt_neg[0], bt_neg[1] + 19)
+    sh.wire(bt_neg[0], bt_neg[1] + 19, 100, bt_neg[1] + 19)
+    sh.wire(100, bt_neg[1] + 19, 100, cb_nv[1])
+    sh.wire(100, cb_nv[1], *cb_nv)
+    sh.label(BT_X + 5, bt_neg[1] + 19, "-114V")
 
     # Contactor Box → Motor Controller HV
-    sh.wire(CB_X + 22, CB_Y - 20, MC_X - 27, MC_Y - 30)
-    sh.wire(CB_X + 22, CB_Y - 10, MC_X - 27, MC_Y - 10)
-    sh.label(CB_X + 25, CB_Y - 20, "+114V_TO_MC")
-    sh.label(CB_X + 25, CB_Y - 10, "-114V_TO_MC")
+    cb_pout = sh.p("U1", "+114V_OUT")
+    cb_nout = sh.p("U1", "-114V_OUT")
+    mc_pv = sh.p("U2", "+114V")
+    mc_nv = sh.p("U2", "-114V")
+    sh.wire(*cb_pout, *mc_pv)
+    sh.wire(*cb_nout, *mc_nv)
+    sh.label(cb_pout[0] + 3, cb_pout[1], "+114V_TO_MC")
+    sh.label(cb_nout[0] + 3, cb_nout[1], "-114V_TO_MC")
 
     # Motor Controller → Motor L1/L2/L3
-    for i, lbl in enumerate(["L1", "L2", "L3"]):
-        my_y = MC_Y - 16 + i * 11
-        mm_y = MOT_Y - 12 + i * 8
-        sh.wire(MC_X + 27, my_y, MC_X + 40, my_y)
-        sh.wire(MC_X + 40, my_y, MOT_X - 16, mm_y)
-        sh.label(MC_X + 30, my_y, lbl)
+    for lbl in ["L1", "L2", "L3"]:
+        mcx, mcy = sh.p("U2", lbl)
+        mmx, mmy = sh.p("M1", lbl)
+        sh.wire(mcx, mcy, mcx + 13, mcy)
+        sh.wire(mcx + 13, mcy, mmx, mmy)
+        sh.label(mcx + 3, mcy, lbl)
 
     # Motor PE
-    sh.wire(MOT_X - 16, MOT_Y + 14, MOT_X - 30, MOT_Y + 14)
-    sh.glabel(MOT_X - 30, MOT_Y + 14, "CHASSIS_GND", 180, "input")
+    pe = sh.p("M1", "PE")
+    sh.wire(*pe, pe[0] - 14, pe[1])
+    sh.glabel(pe[0] - 14, pe[1], "CHASSIS_GND", 180, "input")
 
     # -- Global labels for inter-sheet connections --
-    sh.glabel(CB_X, CB_Y + 32, "GND", 270, "input")
-    sh.wire(CB_X, CB_Y + 30, CB_X, CB_Y + 32)
+    cb_gnd = sh.p("U1", "GND")
+    sh.wire(*cb_gnd, cb_gnd[0], cb_gnd[1] + 10)
+    sh.glabel(cb_gnd[0], cb_gnd[1] + 10, "GND", 270, "input")
 
     # Contactor Box control signals (global for cross-sheet)
-    ctrl_pins = ["CB_RUN", "BMS_CMD", "CHG_START", "PREHEAT", "CHARGE"]
-    for i, cname in enumerate(ctrl_pins):
-        px = CB_X - 16 + i * 8
-        sh.wire(px, CB_Y - 32, px, CB_Y - 45)
-        sh.glabel(px, CB_Y - 45, cname, 90)
+    for cname in ["CB_RUN", "BMS_CMD", "CHG_START", "PREHEAT", "CHARGE"]:
+        cx, cy = sh.p("U1", cname)
+        sh.wire(cx, cy, cx, cy - 13)
+        sh.glabel(cx, cy - 13, cname, 90)
 
-    # Motor Controller signals (global)
+    # Motor Controller top signals (global)
     mc_top_sigs = ["DRIVE", "START", "DRIVE_RDY", "FAULT", "POWER",
-                   "RED_PWR", "BRAKE_SW", "REVERSE", "GEAR_LOCK", "RAD_FAN_CMD"]
-    for i, sig in enumerate(mc_top_sigs):
-        px = MC_X - 22 + i * 5
-        sh.wire(px, MC_Y - 42, px, MC_Y - 55)
-        sh.glabel(px, MC_Y - 55, sig, 90)
+                   "RED_PWR", "BRAKE_SW", "REVERSE", "GEAR_LOCK", "RAD_FAN"]
+    for sig in mc_top_sigs:
+        mx, my = sh.p("U2", sig)
+        sh.wire(mx, my, mx, my - 13)
+        sh.glabel(mx, my - 13, sig if sig != "RAD_FAN" else "RAD_FAN_CMD", 90)
 
     # Motor Controller K_LINE / L_LINE
-    sh.wire(MC_X - 5, MC_Y + 42, MC_X - 5, MC_Y + 55)
-    sh.glabel(MC_X - 5, MC_Y + 55, "K_LINE", 270)
-    sh.wire(MC_X + 5, MC_Y + 42, MC_X + 5, MC_Y + 55)
-    sh.glabel(MC_X + 5, MC_Y + 55, "L_LINE", 270)
+    kx, ky = sh.p("U2", "K_LINE")
+    sh.wire(kx, ky, kx, ky + 13)
+    sh.glabel(kx, ky + 13, "K_LINE", 270)
+    lx, ly = sh.p("U2", "L_LINE")
+    sh.wire(lx, ly, lx, ly + 13)
+    sh.glabel(lx, ly + 13, "L_LINE", 270)
 
-    # +114V global for DC/DC and charger
-    sh.glabel(CB_X + 22, CB_Y + 5, "+114V", 0, "output")
-    sh.glabel(CB_X + 22, CB_Y + 15, "+12V_FROM_CB", 0, "output")
+    # +114V / +12V globals from Contactor Box right side
+    pch = sh.p("U1", "+12V_OUT")
+    sh.wire(*pch, pch[0] + 10, pch[1])
+    sh.glabel(pch[0] + 10, pch[1], "+12V_FROM_CB", 0, "output")
+    prch = sh.p("U1", "PRECHARGE_OUT")
+    sh.wire(*prch, prch[0] + 10, prch[1])
+    sh.glabel(prch[0] + 10, prch[1], "+114V", 0, "output")
 
     # +12V from fuse F28
     sh.glabel(150, 240, "+12V_F28_DRIVE", 180)
@@ -715,41 +767,40 @@ def build_s03_motor_ctrl():
     # -- Global labels for cross-sheet --
     mc_l_sigs = ["DRIVE", "START", "DRIVE_RDY", "FAULT",
                  "RED_PWR", "BRAKE_SW", "REVERSE"]
-    body_h = 70
-    sp = body_h / (len(mc_l_sigs) + 1)
-    for i, sig in enumerate(mc_l_sigs):
-        py = MC_Y - body_h / 2 + sp * (i + 1)
-        sh.wire(MC_X - 27, py, MC_X - 45, py)
-        sh.glabel(MC_X - 45, py, sig, 180)
+    for sig in mc_l_sigs:
+        px, py = sh.p("U1", sig)
+        sh.wire(px, py, px - 18, py)
+        sh.glabel(px - 18, py, sig, 180)
 
     mc_r_sigs = ["GEAR_LOCK", "RAD_FAN_CMD", "K_LINE", "L_LINE",
                  "+12V_BAT", "GND", "POWER"]
-    sp_r = body_h / (len(mc_r_sigs) + 1)
-    for i, sig in enumerate(mc_r_sigs):
-        py = MC_Y - body_h / 2 + sp_r * (i + 1)
-        sh.wire(MC_X + 27, py, MC_X + 45, py)
+    for sig in mc_r_sigs:
+        px, py = sh.p("U1", sig)
+        sh.wire(px, py, px + 18, py)
         if sig in ("GND", "+12V_BAT"):
-            sh.glabel(MC_X + 45, py, sig, 0, "input" if sig == "GND" else "output")
+            sh.glabel(px + 18, py, sig, 0, "input" if sig == "GND" else "output")
         else:
-            sh.glabel(MC_X + 45, py, sig, 0)
+            sh.glabel(px + 18, py, sig, 0)
 
     # BMS signals
     bms_r_sigs = ["BMS_CMD", "CHG_STATUS_OK", "K_LINE", "L_LINE"]
-    sp_b = 40 / (len(bms_r_sigs) + 1)
-    for i, sig in enumerate(bms_r_sigs):
-        py = BMS_Y - 20 + sp_b * (i + 1)
-        sh.wire(BMS_X + 17, py, BMS_X + 35, py)
-        sh.glabel(BMS_X + 35, py, sig, 0)
+    for sig in bms_r_sigs:
+        px, py = sh.p("U2", sig)
+        sh.wire(px, py, px + 18, py)
+        sh.glabel(px + 18, py, sig, 0)
 
     # Brake switch connection
-    sh.wire(BS_X - 10, BS_Y, BS_X - 25, BS_Y)
-    sh.glabel(BS_X - 25, BS_Y, "BRAKE_SW", 180)
-    sh.wire(BS_X + 10, BS_Y, BS_X + 25, BS_Y)
-    sh.glabel(BS_X + 25, BS_Y, "BRAKE_LIGHT_FEED", 0)
+    bs_in = sh.p("SW1", "IN")
+    sh.wire(*bs_in, bs_in[0] - 15, bs_in[1])
+    sh.glabel(bs_in[0] - 15, bs_in[1], "BRAKE_SW", 180)
+    bs_out = sh.p("SW1", "OUT")
+    sh.wire(*bs_out, bs_out[0] + 15, bs_out[1])
+    sh.glabel(bs_out[0] + 15, bs_out[1], "BRAKE_LIGHT_FEED", 0)
 
     # Radiator fan relay
-    sh.glabel(280 + 11, 150 - 6, "RAD_FAN_CMD", 0)
-    sh.wire(280 + 11, 150 - 6, 280 + 20, 150 - 6)
+    k2_coil_p = sh.p("K2", "86_COIL+")
+    sh.wire(*k2_coil_p, k2_coil_p[0] + 12, k2_coil_p[1])
+    sh.glabel(k2_coil_p[0] + 12, k2_coil_p[1], "RAD_FAN_CMD", 0)
 
     # -- Wire color annotations --
     sh.text(30, 260, "Wire colors:", 1.3)
@@ -811,50 +862,54 @@ def build_s04_sensors():
     sh.place("Think:DCDC_HI_REF", "U2", "DC/DC High Effect Ref", 300, 160)
 
     # -- Motor Position Sensor connections --
-    pos_sigs = ["POS_SENSE_1", "POS_SENSE_2", "POS_SENSE_3",
-                "POS_SENSE_4", "POS_SENSE_5", "POS_SENSE_6"]
-    sp = 50 / (6 + 1)
-    for i, sig in enumerate(pos_sigs):
-        py = PS_Y - 25 + sp * (i + 1)
-        sh.wire(PS_X - 17, py, PS_X - 35, py)
-        sh.glabel(PS_X - 35, py, sig, 180)
+    ps_l_pins = ["POS1", "POS2", "POS3", "POS4", "POS5", "POS6"]
+    ps_l_labels = ["POS_SENSE_1", "POS_SENSE_2", "POS_SENSE_3",
+                   "POS_SENSE_4", "POS_SENSE_5", "POS_SENSE_6"]
+    for pin, sig in zip(ps_l_pins, ps_l_labels):
+        px, py = sh.p("U1", pin)
+        sh.wire(px, py, px - 18, py)
+        sh.glabel(px - 18, py, sig, 180)
 
     # Right side
-    r_sigs = ["MOTOR_TEMP_POS", "MOTOR_TEMP_NEG", "+5V_SENSOR", "GND", "SHIELD_GND"]
-    sp_r = 50 / (5 + 1)
-    for i, sig in enumerate(r_sigs):
-        py = PS_Y - 25 + sp_r * (i + 1)
-        sh.wire(PS_X + 17, py, PS_X + 35, py)
+    ps_r_pins = ["MOTOR_TEMP+", "MOTOR_TEMP-", "+5V", "GND", "SHIELD"]
+    ps_r_labels = ["MOTOR_TEMP_POS", "MOTOR_TEMP_NEG", "+5V_SENSOR", "GND", "SHIELD_GND"]
+    for pin, sig in zip(ps_r_pins, ps_r_labels):
+        px, py = sh.p("U1", pin)
+        sh.wire(px, py, px + 18, py)
         shape = "input" if "GND" in sig else "bidirectional"
-        sh.glabel(PS_X + 35, py, sig, 0, shape)
+        sh.glabel(px + 18, py, sig, 0, shape)
 
     # -- Gear Selector connections --
-    gs_sigs = ["PARK_SW", "FREE_SW", "DRIVE", "REVERSE"]
-    sp_gs = 36 / (4 + 1)
-    for i, sig in enumerate(gs_sigs):
-        py = GS_Y - 18 + sp_gs * (i + 1)
-        sh.wire(GS_X + 13, py, GS_X + 30, py)
-        sh.glabel(GS_X + 30, py, sig, 0)
+    gs_r_pins = ["PARK", "FREE", "DRIVE", "REVERSE"]
+    gs_r_labels = ["PARK_SW", "FREE_SW", "DRIVE", "REVERSE"]
+    for pin, sig in zip(gs_r_pins, gs_r_labels):
+        px, py = sh.p("SW1", pin)
+        sh.wire(px, py, px + 17, py)
+        sh.glabel(px + 17, py, sig, 0)
 
-    sh.wire(GS_X - 13, GS_Y, GS_X - 25, GS_Y)
-    sh.glabel(GS_X - 25, GS_Y, "GND", 180, "input")
+    gs_gnd = sh.p("SW1", "GND")
+    sh.wire(*gs_gnd, gs_gnd[0] - 12, gs_gnd[1])
+    sh.glabel(gs_gnd[0] - 12, gs_gnd[1], "GND", 180, "input")
 
     # -- Throttle Pedal connections --
-    sh.wire(TP_X - 14, TP_Y - 8, TP_X - 30, TP_Y - 8)
-    sh.glabel(TP_X - 30, TP_Y - 8, "+5V_RUN", 180, "output")
-    sh.wire(TP_X - 14, TP_Y + 8, TP_X - 30, TP_Y + 8)
-    sh.glabel(TP_X - 30, TP_Y + 8, "ANALOG_GND", 180, "input")
-    sh.wire(TP_X + 14, TP_Y - 8, TP_X + 30, TP_Y - 8)
-    sh.glabel(TP_X + 30, TP_Y - 8, "THROTTLE_POS", 0)
-    sh.wire(TP_X + 14, TP_Y + 8, TP_X + 30, TP_Y + 8)
-    sh.glabel(TP_X + 30, TP_Y + 8, "THROTTLE_PULL", 0)
+    for pin, sig, dx, shape in [
+        ("+5V_RUN",       "+5V_RUN",       -16, "output"),
+        ("ANALOG_GND",    "ANALOG_GND",    -16, "input"),
+        ("POSITION",      "THROTTLE_POS",   16, "bidirectional"),
+        ("THROTTLE_PULL", "THROTTLE_PULL",  16, "bidirectional"),
+    ]:
+        px, py = sh.p("BP1", pin)
+        sh.wire(px, py, px + dx, py)
+        sh.glabel(px + dx, py, sig, 180 if dx < 0 else 0, shape)
     sh.text(TP_X + 35, TP_Y + 5, "Wire: 0.75mm2 YEL", 0.9)
 
     # DC/DC reference
-    sh.wire(300 - 10, 160, 300 - 25, 160)
-    sh.glabel(300 - 25, 160, "DC_HI_PWR", 180)
-    sh.wire(300 + 10, 160, 300 + 25, 160)
-    sh.glabel(300 + 25, 160, "POWER", 0)
+    u2_in = sh.p("U2", "IN")
+    sh.wire(*u2_in, u2_in[0] - 15, u2_in[1])
+    sh.glabel(u2_in[0] - 15, u2_in[1], "DC_HI_PWR", 180)
+    u2_out = sh.p("U2", "OUT")
+    sh.wire(*u2_out, u2_out[0] + 15, u2_out[1])
+    sh.glabel(u2_out[0] + 15, u2_out[1], "POWER", 0)
 
     # -- Annotations --
     sh.text(30, 255, "SENSOR CONNECTIONS", 1.8)
@@ -918,62 +973,85 @@ def build_s05_regen_dcdc():
     sh.place("Think:CONTROL_LAMP", "DS1", "Control Lamp (14/176)", 300, 200)
 
     # -- Wiring --
-    # HV Distribution → 100A fuse → DC/DC +114V
-    sh.wire(HVDB_X + 16, HVDB_Y - 8, 121, 85)
-    sh.wire(139, 85, DCDC_X - 17, DCDC_Y - 9)
-    sh.label(135, 82, "+114V_DCDC")
+    # HV Distribution +114V_DCDC → 100A fuse → DC/DC +114V_IN
+    hvdb_dcdc_p = sh.p("U2", "+114V_DCDC")
+    f1_a = sh.p("F1", "A")
+    f1_b = sh.p("F1", "B")
+    dcdc_pv = sh.p("U1", "+114V_IN")
+    sh.wire(*hvdb_dcdc_p, f1_a[0], hvdb_dcdc_p[1])
+    sh.wire(f1_a[0], hvdb_dcdc_p[1], *f1_a)
+    sh.wire(*f1_b, dcdc_pv[0], f1_b[1])
+    sh.wire(dcdc_pv[0], f1_b[1], *dcdc_pv)
+    sh.label(f1_b[0] + 3, f1_b[1], "+114V_DCDC")
 
-    # HV Distribution → DC/DC -114V
-    sh.wire(HVDB_X + 16, HVDB_Y - 1, 120, DCDC_Y)
-    sh.wire(120, DCDC_Y, DCDC_X - 17, DCDC_Y)
-    sh.label(125, DCDC_Y - 3, "-114V_DCDC")
+    # HV Distribution -114V_DCDC → DC/DC -114V_IN
+    hvdb_dcdc_n = sh.p("U2", "-114V_DCDC")
+    dcdc_nv = sh.p("U1", "-114V_IN")
+    sh.wire(*hvdb_dcdc_n, 120, hvdb_dcdc_n[1])
+    sh.wire(120, hvdb_dcdc_n[1], 120, dcdc_nv[1])
+    sh.wire(120, dcdc_nv[1], *dcdc_nv)
+    sh.label(125, dcdc_nv[1] - 3, "-114V_DCDC")
 
     # DC/DC +12V out
-    sh.wire(DCDC_X + 17, DCDC_Y - 9, DCDC_X + 35, DCDC_Y - 9)
-    sh.glabel(DCDC_X + 35, DCDC_Y - 9, "+12V_ALWAYS", 0, "output")
-    sh.text(DCDC_X + 37, DCDC_Y - 13, "To 12V battery -> Sheet 01", 0.9)
+    dcdc_12p = sh.p("U1", "+12V_OUT")
+    sh.wire(*dcdc_12p, dcdc_12p[0] + 18, dcdc_12p[1])
+    sh.glabel(dcdc_12p[0] + 18, dcdc_12p[1], "+12V_ALWAYS", 0, "output")
+    sh.text(dcdc_12p[0] + 20, dcdc_12p[1] - 4, "To 12V battery -> Sheet 01", 0.9)
 
     # DC/DC -12V out (GND)
-    sh.wire(DCDC_X + 17, DCDC_Y, DCDC_X + 35, DCDC_Y)
-    sh.glabel(DCDC_X + 35, DCDC_Y, "GND", 0, "input")
+    dcdc_12n = sh.p("U1", "-12V_OUT")
+    sh.wire(*dcdc_12n, dcdc_12n[0] + 18, dcdc_12n[1])
+    sh.glabel(dcdc_12n[0] + 18, dcdc_12n[1], "GND", 0, "input")
 
     # DC/DC HI_PWR_IN (from motor controller)
-    sh.wire(DCDC_X, DCDC_Y - 20, DCDC_X, DCDC_Y - 35)
-    sh.glabel(DCDC_X, DCDC_Y - 35, "DC_HI_PWR", 90)
-    sh.text(DCDC_X + 3, DCDC_Y - 33, "From Motor Ctrl -> Sheet 02", 0.9)
+    dcdc_hi = sh.p("U1", "HI_PWR_IN")
+    sh.wire(*dcdc_hi, dcdc_hi[0], dcdc_hi[1] - 15)
+    sh.glabel(dcdc_hi[0], dcdc_hi[1] - 15, "DC_HI_PWR", 90)
+    sh.text(dcdc_hi[0] + 3, dcdc_hi[1] - 13, "From Motor Ctrl -> Sheet 02", 0.9)
 
     # DC/DC LO_PWR_OUT (to BMS)
-    sh.wire(DCDC_X - 5, DCDC_Y + 20, DCDC_X - 5, DCDC_Y + 35)
-    sh.glabel(DCDC_X - 5, DCDC_Y + 35, "DC_LO_PWR", 270)
-    sh.text(DCDC_X - 2, DCDC_Y + 33, "To BMS -> Sheet 06", 0.9)
+    dcdc_lo = sh.p("U1", "LO_PWR_OUT")
+    sh.wire(*dcdc_lo, dcdc_lo[0], dcdc_lo[1] + 15)
+    sh.glabel(dcdc_lo[0], dcdc_lo[1] + 15, "DC_LO_PWR", 270)
+    sh.text(dcdc_lo[0] + 3, dcdc_lo[1] + 13, "To BMS -> Sheet 06", 0.9)
 
     # DC/DC FAULT
-    sh.wire(DCDC_X + 5, DCDC_Y + 20, DCDC_X + 5, DCDC_Y + 35)
-    sh.glabel(DCDC_X + 5, DCDC_Y + 35, "DCDC_FAULT", 270)
+    dcdc_flt = sh.p("U1", "FAULT")
+    sh.wire(*dcdc_flt, dcdc_flt[0], dcdc_flt[1] + 15)
+    sh.glabel(dcdc_flt[0], dcdc_flt[1] + 15, "DCDC_FAULT", 270)
 
     # HV Distribution input from battery
-    sh.wire(HVDB_X - 16, HVDB_Y - 8, HVDB_X - 30, HVDB_Y - 8)
-    sh.glabel(HVDB_X - 30, HVDB_Y - 8, "+114V", 180)
-    sh.wire(HVDB_X - 16, HVDB_Y + 1, HVDB_X - 30, HVDB_Y + 1)
-    sh.glabel(HVDB_X - 30, HVDB_Y + 1, "-114V", 180)
+    hvdb_pi = sh.p("U2", "+114V_IN")
+    sh.wire(*hvdb_pi, hvdb_pi[0] - 14, hvdb_pi[1])
+    sh.glabel(hvdb_pi[0] - 14, hvdb_pi[1], "+114V", 180)
+    hvdb_ni = sh.p("U2", "-114V_IN")
+    sh.wire(*hvdb_ni, hvdb_ni[0] - 14, hvdb_ni[1])
+    sh.glabel(hvdb_ni[0] - 14, hvdb_ni[1], "-114V", 180)
 
     # HV Distribution to Contactor Box
-    sh.wire(HVDB_X + 16, HVDB_Y - 15, HVDB_X + 35, HVDB_Y - 15)
-    sh.glabel(HVDB_X + 35, HVDB_Y - 15, "+114V_CB", 0)
-    sh.wire(HVDB_X + 16, HVDB_Y - 8, HVDB_X + 35, HVDB_Y - 22)
+    hvdb_cb_p = sh.p("U2", "+114V_CB")
+    sh.wire(*hvdb_cb_p, hvdb_cb_p[0] + 19, hvdb_cb_p[1])
+    sh.glabel(hvdb_cb_p[0] + 19, hvdb_cb_p[1], "+114V_CB", 0)
+    hvdb_cb_n = sh.p("U2", "-114V_CB")
+    sh.wire(*hvdb_cb_n, hvdb_cb_n[0] + 19, hvdb_cb_n[1])
+    sh.glabel(hvdb_cb_n[0] + 19, hvdb_cb_n[1], "-114V_CB", 0)
 
     # HV Distribution to Charger
-    sh.wire(HVDB_X + 16, HVDB_Y + 8, HVDB_X + 35, HVDB_Y + 8)
-    sh.glabel(HVDB_X + 35, HVDB_Y + 8, "+114V_CHARGER", 0)
-    sh.wire(HVDB_X + 16, HVDB_Y + 15, HVDB_X + 35, HVDB_Y + 15)
-    sh.glabel(HVDB_X + 35, HVDB_Y + 15, "-114V_CHARGER", 0)
-    sh.text(HVDB_X + 37, HVDB_Y + 12, "To Charger -> Sheet 06", 0.9)
+    hvdb_chg_p = sh.p("U2", "+114V_CHG")
+    sh.wire(*hvdb_chg_p, hvdb_chg_p[0] + 19, hvdb_chg_p[1])
+    sh.glabel(hvdb_chg_p[0] + 19, hvdb_chg_p[1], "+114V_CHARGER", 0)
+    hvdb_chg_n = sh.p("U2", "-114V_CHG")
+    sh.wire(*hvdb_chg_n, hvdb_chg_n[0] + 19, hvdb_chg_n[1])
+    sh.glabel(hvdb_chg_n[0] + 19, hvdb_chg_n[1], "-114V_CHARGER", 0)
+    sh.text(hvdb_chg_p[0] + 21, hvdb_chg_p[1] - 2, "To Charger -> Sheet 06", 0.9)
 
     # Control lamp
-    sh.wire(300 - 9, 200, 300 - 20, 200)
-    sh.glabel(300 - 20, 200, "REGEN_LAMP", 180)
-    sh.wire(300 + 9, 200, 300 + 20, 200)
-    sh.glabel(300 + 20, 200, "GND", 0, "input")
+    ds1_p = sh.p("DS1", "+")
+    sh.wire(*ds1_p, ds1_p[0] - 11, ds1_p[1])
+    sh.glabel(ds1_p[0] - 11, ds1_p[1], "REGEN_LAMP", 180)
+    ds1_n = sh.p("DS1", "-")
+    sh.wire(*ds1_n, ds1_n[0] + 11, ds1_n[1])
+    sh.glabel(ds1_n[0] + 11, ds1_n[1], "GND", 0, "input")
 
     # -- Annotations --
     sh.text(30, 240, "DC/DC CONVERTER & HV DISTRIBUTION", 1.8)
@@ -1064,96 +1142,90 @@ def build_s06_bms_charger():
 
     # -- BMS wiring --
     # BMS left side
-    bms_l = ["BAT_12V", "GND", "DC_LO_PWR", "CHG_START_IN"]
-    sp = 54 / (4 + 1)
-    for i, sig in enumerate(bms_l):
-        py = BMS_Y - 27 + sp * (i + 1)
-        sh.wire(BMS_X - 22, py, BMS_X - 38, py)
+    bms_l_map = [("BAT_12V", "+12V_F28_DRIVE"), ("BAT_GND", "GND"),
+                 ("DC_LO_PWR", "DC_LO_PWR"), ("CHG_START_IN", "CHG_START_IN")]
+    for pin, sig in bms_l_map:
+        px, py = sh.p("U1", pin)
+        sh.wire(px, py, px - 16, py)
         shape = "input" if sig == "GND" else "bidirectional"
-        if sig == "BAT_12V":
-            sh.glabel(BMS_X - 38, py, "+12V_F28_DRIVE", 180)
-        elif sig == "GND":
-            sh.glabel(BMS_X - 38, py, "GND", 180, "input")
-        else:
-            sh.glabel(BMS_X - 38, py, sig, 180)
+        sh.glabel(px - 16, py, sig, 180, shape)
 
     # BMS right side
-    bms_r = ["CHG_STATUS_OK", "CHG_START_OUT", "BMS_CMD", "K_LINE", "L_LINE"]
-    sp_r = 54 / (5 + 1)
-    for i, sig in enumerate(bms_r):
-        py = BMS_Y - 27 + sp_r * (i + 1)
-        sh.wire(BMS_X + 22, py, BMS_X + 38, py)
-        sh.glabel(BMS_X + 38, py, sig, 0)
+    bms_r_pins = ["CHG_STATUS_OK", "CHG_START_OUT", "BMS_CMD", "K_LINE", "L_LINE"]
+    for pin in bms_r_pins:
+        px, py = sh.p("U1", pin)
+        sh.wire(px, py, px + 16, py)
+        sh.glabel(px + 16, py, pin, 0)
 
     # BMS top side - current sense
-    bms_t = ["CURR_S_12V", "CURR_S_GND", "CURR_SENSE", "BATT_COOLING"]
-    sp_t = 40 / (4 + 1)
-    for i, sig in enumerate(bms_t):
-        px = BMS_X - 20 + sp_t * (i + 1) * 2
-        sh.wire(px, BMS_Y - 29, px, BMS_Y - 42)
-        sh.glabel(px, BMS_Y - 42, sig, 90)
+    bms_t_pins = ["CURR_S_12V", "CURR_S_GND", "CURR_SENSE", "BATT_COOLING"]
+    for pin in bms_t_pins:
+        px, py = sh.p("U1", pin)
+        sh.wire(px, py, px, py - 13)
+        sh.glabel(px, py - 13, pin, 90)
 
     # BMS bottom - temp sensors
-    bms_b = ["TEMP1", "TEMP2", "TEMP3", "TEMP4"]
-    sp_b = 40 / (4 + 1)
-    for i, sig in enumerate(bms_b):
-        px = BMS_X - 20 + sp_b * (i + 1) * 2
-        sh.wire(px, BMS_Y + 29, px, BMS_Y + 40)
-        sh.label(px, BMS_Y + 40, sig)
+    bms_b_pins = ["TEMP1", "TEMP2", "TEMP3", "TEMP4"]
+    for i, pin in enumerate(bms_b_pins):
+        px, py = sh.p("U1", pin)
+        sh.wire(px, py, px, py + 11)
+        sh.label(px, py + 11, pin)
         # Connect to temp sensors
-        sh.wire(px, BMS_Y + 40, 60 + i * 25, 174)
+        rt_p = sh.p(f"RT{i+1}", "T+")
+        sh.wire(px, py + 11, *rt_p)
 
     # Charger wiring
     # Charger left (AC)
-    chg_l = ["L1_AC", "L2_AC", "GND_AC"]
-    sp_cl = 40 / (3 + 1)
-    for i, sig in enumerate(chg_l):
-        py = CHG_Y - 20 + sp_cl * (i + 1)
-        sh.wire(CHG_X - 17, py, CHG_X - 30, py)
-        sh.label(CHG_X - 30, py, sig)
+    for pin in ["L1_AC", "L2_AC", "GND_AC"]:
+        px, py = sh.p("U2", pin)
+        sh.wire(px, py, px - 13, py)
+        sh.label(px - 13, py, pin)
 
     # Charger right (HV DC out)
-    sh.wire(CHG_X + 17, CHG_Y - 8, CHG_X + 32, CHG_Y - 8)
-    sh.glabel(CHG_X + 32, CHG_Y - 8, "+114V_CHARGER", 0)
-    sh.wire(CHG_X + 17, CHG_Y + 2, CHG_X + 32, CHG_Y + 2)
-    sh.glabel(CHG_X + 32, CHG_Y + 2, "-114V_CHARGER", 0)
+    for pin, sig in [("+114V_DC", "+114V_CHARGER"), ("-114V_DC", "-114V_CHARGER")]:
+        px, py = sh.p("U2", pin)
+        sh.wire(px, py, px + 15, py)
+        sh.glabel(px + 15, py, sig, 0)
 
     # Charger top (control)
-    sh.wire(CHG_X - 5, CHG_Y - 22, CHG_X - 5, CHG_Y - 35)
-    sh.glabel(CHG_X - 5, CHG_Y - 35, "CHG_START", 90)
-    sh.wire(CHG_X + 5, CHG_Y - 22, CHG_X + 5, CHG_Y - 35)
-    sh.glabel(CHG_X + 5, CHG_Y - 35, "CHG_STATUS_OK", 90)
+    for pin, sig in [("CHG_START", "CHG_START"), ("CHG_STATUS_OK", "CHG_STATUS_OK")]:
+        px, py = sh.p("U2", pin)
+        sh.wire(px, py, px, py - 13)
+        sh.glabel(px, py - 13, sig, 90)
 
     # Charger bottom (diagnostic)
-    sh.wire(CHG_X - 5, CHG_Y + 22, CHG_X - 5, CHG_Y + 35)
-    sh.glabel(CHG_X - 5, CHG_Y + 35, "K_LINE", 270)
-    sh.wire(CHG_X + 5, CHG_Y + 22, CHG_X + 5, CHG_Y + 35)
-    sh.glabel(CHG_X + 5, CHG_Y + 35, "L_LINE", 270)
+    for pin in ["K_LINE", "L_LINE"]:
+        px, py = sh.p("U2", pin)
+        sh.wire(px, py, px, py + 13)
+        sh.glabel(px, py + 13, pin, 270)
 
     # 230V relay → AC connector
-    sh.wire(300 + 11, 200 - 4, 380 - 11, 200 - 4)
-    sh.label(330, 197, "230V_L1")
+    k1_com = sh.p("K1", "30_COM")
+    j1_l1 = sh.p("J1", "L1")
+    sh.wire(*k1_com, *j1_l1)
+    sh.label(k1_com[0] + 15, k1_com[1], "230V_L1")
 
     # Cooling relay
-    sh.wire(50 - 11, 240 - 4, 50 - 25, 240 - 4)
-    sh.glabel(50 - 25, 236, "BATT_COOLING", 180)
+    k2_coil_p = sh.p("K2", "86_COIL+")
+    sh.wire(*k2_coil_p, k2_coil_p[0] - 14, k2_coil_p[1])
+    sh.glabel(k2_coil_p[0] - 14, k2_coil_p[1], "BATT_COOLING", 180)
 
     # Radiator fan power
-    sh.wire(100 - 10, 230, 100 - 22, 230)
-    sh.glabel(100 - 22, 230, "+12V_F6_RADFAN", 180)
-    sh.wire(100 + 10, 230, 100 + 18, 230)
-    sh.glabel(100 + 18, 230, "GND", 0, "input")
-
-    sh.wire(100 - 10, 255, 100 - 22, 255)
-    sh.glabel(100 - 22, 255, "+12V_F6_RADFAN", 180)
-    sh.wire(100 + 10, 255, 100 + 18, 255)
-    sh.glabel(100 + 18, 255, "GND", 0, "input")
+    for ref in ["M1", "M2"]:
+        mp = sh.p(ref, "M+")
+        mn = sh.p(ref, "M-")
+        sh.wire(*mp, mp[0] - 12, mp[1])
+        sh.glabel(mp[0] - 12, mp[1], "+12V_F6_RADFAN", 180)
+        sh.wire(*mn, mn[0] + 8, mn[1])
+        sh.glabel(mn[0] + 8, mn[1], "GND", 0, "input")
 
     # Coolant pump power
-    sh.wire(200 - 10, 240, 200 - 22, 240)
-    sh.glabel(200 - 22, 240, "+12V_F10_WPUMP_CHG", 180)
-    sh.wire(200 + 10, 240, 200 + 18, 240)
-    sh.glabel(200 + 18, 240, "GND", 0, "input")
+    m3p = sh.p("M3", "M+")
+    m3n = sh.p("M3", "M-")
+    sh.wire(*m3p, m3p[0] - 12, m3p[1])
+    sh.glabel(m3p[0] - 12, m3p[1], "+12V_F10_WPUMP_CHG", 180)
+    sh.wire(*m3n, m3n[0] + 8, m3n[1])
+    sh.glabel(m3n[0] + 8, m3n[1], "GND", 0, "input")
 
     # -- Wire color annotations --
     sh.text(30, 268, "Wire: 0.75mm2 WHT (BMS control signals)", 0.9)
@@ -1233,69 +1305,93 @@ def build_s07_headlights():
 
     # -- Wiring --
     # Headlight switch input
-    sh.wire(HSW_X - 15, HSW_Y, HSW_X - 30, HSW_Y)
-    sh.glabel(HSW_X - 30, HSW_Y, "+12V_F2_LIGHTS", 180)
-    sh.text(HSW_X - 28, HSW_Y - 4, "From F2 (40A)", 0.9)
+    hsw_in = sh.p("SW1", "BAT_IN")
+    sh.wire(*hsw_in, hsw_in[0] - 15, hsw_in[1])
+    sh.glabel(hsw_in[0] - 15, hsw_in[1], "+12V_F2_LIGHTS", 180)
+    sh.text(hsw_in[0] - 13, hsw_in[1] - 4, "From F2 (40A)", 0.9)
 
-    # Switch → DRL relay
-    sh.wire(HSW_X + 15, HSW_Y - 10, 151, 50 - 4)
-    sh.label(90, HSW_Y - 12, "PARK_OUT")
+    # Switch → DRL relay coil
+    sw_park = sh.p("SW1", "PARK")
+    k1_coil_p = sh.p("K1", "86_COIL+")
+    sh.wire(*sw_park, *k1_coil_p)
+    sh.label(sw_park[0] + 10, sw_park[1] - 2, "PARK_OUT")
 
-    # Switch → Park light relay
-    sh.wire(HSW_X + 15, HSW_Y - 3, 151, 100 - 4)
+    # Switch → Park light relay coil
+    sw_low = sh.p("SW1", "LOW_BEAM")
+    k2_coil_p = sh.p("K2", "86_COIL+")
+    sh.wire(*sw_low, *k2_coil_p)
 
-    # Switch → Low beam
-    hw_sp = 36 / 5
-    sh.wire(HSW_X + 15, HSW_Y + hw_sp, 200, HSW_Y + hw_sp)
-    sh.label(100, HSW_Y + hw_sp - 3, "LOW_BEAM_OUT")
+    # Switch → Low beam routing
+    sw_high = sh.p("SW1", "HIGH_BEAM")
+    sh.wire(*sw_high, 200, sw_high[1])
+    sh.label(sw_high[0] + 10, sw_high[1] - 3, "LOW_BEAM_OUT")
 
-    # Switch → High beam
-    sh.wire(HSW_X + 15, HSW_Y + 2 * hw_sp, 200, HSW_Y + 2 * hw_sp)
-    sh.label(100, HSW_Y + 2 * hw_sp - 3, "HIGH_BEAM_OUT")
+    # Switch → High beam / flash routing
+    sw_flash = sh.p("SW1", "FLASH")
+    sh.wire(*sw_flash, 200, sw_flash[1])
+    sh.label(sw_flash[0] + 10, sw_flash[1] - 3, "HIGH_BEAM_OUT")
 
-    # Relay outputs to parking lights
-    sh.wire(160 + 11, 50 - 4, 255, 40)
-    sh.wire(160 + 11, 50, 255, 60)
+    # DRL relay → parking lights
+    k1_com = sh.p("K1", "30_COM")
+    k1_no = sh.p("K1", "87_NO")
+    ds1_p = sh.p("DS1", "+")
+    ds2_p = sh.p("DS2", "+")
+    sh.wire(*k1_com, *ds1_p)
+    sh.wire(*k1_no, *ds2_p)
 
-    # Relay outputs to park/rear lights
-    sh.wire(160 + 11, 100 - 4, 200, 96)
+    # Park light relay → park/rear
+    k2_com = sh.p("K2", "30_COM")
+    sh.wire(*k2_com, 200, k2_com[1])
 
     # Low beam power routing
-    sh.wire(200, HSW_Y + hw_sp, 200, 100)
-    sh.wire(200, 100, 255, 100)
-    sh.wire(200, 100, 200, 120)
-    sh.wire(200, 120, 255, 120)
-    sh.junction(200, 100)
+    sh.wire(200, sw_high[1], 200, ds3_y := sh.p("DS3", "+")[1])
+    ds3_p = sh.p("DS3", "+")
+    sh.wire(200, ds3_y, *ds3_p)
+    ds4_p = sh.p("DS4", "+")
+    sh.wire(200, ds3_y, 200, ds4_p[1])
+    sh.wire(200, ds4_p[1], *ds4_p)
+    sh.junction(200, ds3_y)
 
     # High beam
-    sh.wire(200, HSW_Y + 2 * hw_sp, 200, 160)
-    sh.wire(200, 160, 255, 160)
-    sh.wire(200, 160, 200, 180)
-    sh.wire(200, 180, 255, 180)
-    sh.junction(200, 160)
+    ds5_p = sh.p("DS5", "+")
+    ds6_p = sh.p("DS6", "+")
+    sh.wire(200, sw_flash[1], 200, ds5_p[1])
+    sh.wire(200, ds5_p[1], *ds5_p)
+    sh.wire(200, ds5_p[1], 200, ds6_p[1])
+    sh.wire(200, ds6_p[1], *ds6_p)
+    sh.junction(200, ds5_p[1])
 
     # All bulb grounds
-    for y in [40, 60, 100, 120, 160, 180, 210, 230]:
-        sh.wire(265, y, 280, y)
-        sh.glabel(280, y, "GND", 0, "input")
+    for ref in ["DS1", "DS2", "DS3", "DS4", "DS5", "DS6", "DS7", "DS8"]:
+        nx, ny = sh.p(ref, "-")
+        sh.wire(nx, ny, nx + 15, ny)
+        sh.glabel(nx + 15, ny, "GND", 0, "input")
 
     # License plate power
-    sh.wire(255, 210, 230, 210)
-    sh.glabel(230, 210, "+12V_F23_LICENSE", 180)
-    sh.wire(255, 230, 230, 230)
-    sh.glabel(230, 230, "+12V_F23_LICENSE", 180)
+    ds7_p = sh.p("DS7", "+")
+    sh.wire(*ds7_p, ds7_p[0] - 25, ds7_p[1])
+    sh.glabel(ds7_p[0] - 25, ds7_p[1], "+12V_F23_LICENSE", 180)
+    ds8_p = sh.p("DS8", "+")
+    sh.wire(*ds8_p, ds8_p[0] - 25, ds8_p[1])
+    sh.glabel(ds8_p[0] - 25, ds8_p[1], "+12V_F23_LICENSE", 180)
 
-    # Fuse power globals
-    sh.glabel(255, 40, "+12V_F16_PARK_FRT", 180)
-    sh.glabel(255, 100, "+12V_F27_LOBEAML", 180)
-    sh.glabel(255, 120, "+12V_F26_LOBEAMR", 180)
-    sh.glabel(255, 160, "+12V_F25_HIBEAMR", 180)
+    # Fuse power globals on bulb + pins
+    ds1_pp = sh.p("DS1", "+")
+    sh.glabel(ds1_pp[0] - 5, ds1_pp[1], "+12V_F16_PARK_FRT", 180)
+    ds3_pp = sh.p("DS3", "+")
+    sh.glabel(ds3_pp[0] - 5, ds3_pp[1], "+12V_F27_LOBEAML", 180)
+    ds4_pp = sh.p("DS4", "+")
+    sh.glabel(ds4_pp[0] - 5, ds4_pp[1], "+12V_F26_LOBEAMR", 180)
+    ds5_pp = sh.p("DS5", "+")
+    sh.glabel(ds5_pp[0] - 5, ds5_pp[1], "+12V_F25_HIBEAMR", 180)
 
     # Collision lamp
-    sh.wire(160 - 8, 230, 160 - 20, 230)
-    sh.glabel(160 - 20, 230, "+12V_F17_COLL_ALM", 180)
-    sh.wire(160 + 8, 230, 160 + 20, 230)
-    sh.glabel(160 + 20, 230, "GND", 0, "input")
+    ds9_p = sh.p("DS9", "+")
+    ds9_n = sh.p("DS9", "-")
+    sh.wire(*ds9_p, ds9_p[0] - 12, ds9_p[1])
+    sh.glabel(ds9_p[0] - 12, ds9_p[1], "+12V_F17_COLL_ALM", 180)
+    sh.wire(*ds9_n, ds9_n[0] + 12, ds9_n[1])
+    sh.glabel(ds9_n[0] + 12, ds9_n[1], "GND", 0, "input")
 
     # -- Annotations --
     sh.text(30, 255, "HEADLIGHT SYSTEM", 1.8)
@@ -1366,56 +1462,74 @@ def build_s08_rear_lights():
 
     # -- Wiring --
     # Reverse relay coil
-    sh.wire(80 - 11, 60 - 4, 80 - 25, 56)
-    sh.glabel(80 - 25, 56, "+12V_F15_HTDW_REV", 180)
-    sh.wire(80 - 11, 60 + 4, 80 - 25, 64)
-    sh.glabel(80 - 25, 64, "REVERSE", 180)
-    sh.text(80 - 23, 52, "From F15 (10A)", 0.9)
+    k1_cp = sh.p("K1", "86_COIL+")
+    k1_cn = sh.p("K1", "85_COIL-")
+    sh.wire(*k1_cp, k1_cp[0] - 14, k1_cp[1])
+    sh.glabel(k1_cp[0] - 14, k1_cp[1], "+12V_F15_HTDW_REV", 180)
+    sh.wire(*k1_cn, k1_cn[0] - 14, k1_cn[1])
+    sh.glabel(k1_cn[0] - 14, k1_cn[1], "REVERSE", 180)
+    sh.text(k1_cp[0] - 12, k1_cp[1] - 4, "From F15 (10A)", 0.9)
 
     # Reverse relay → reverse lights
-    sh.wire(80 + 11, 60 - 4, 215, 40)
-    sh.wire(80 + 11, 60, 200, 60)
-    sh.wire(200, 60, 215, 60)
+    k1_com = sh.p("K1", "30_COM")
+    k1_no = sh.p("K1", "87_NO")
+    ds1_p = sh.p("DS1", "+")
+    ds2_p = sh.p("DS2", "+")
+    sh.wire(*k1_com, *ds1_p)
+    sh.wire(*k1_no, 200, k1_no[1])
+    sh.wire(200, k1_no[1], 200, ds2_p[1])
+    sh.wire(200, ds2_p[1], *ds2_p)
 
     # Brake light switch input
-    sh.wire(80 - 11, 120, 80 - 25, 120)
-    sh.glabel(80 - 25, 120, "+12V_F12_BRAKE", 180)
-    sh.text(80 - 23, 116, "From F12 (10A)", 0.9)
+    sw1_in = sh.p("SW1", "IN")
+    sh.wire(*sw1_in, sw1_in[0] - 14, sw1_in[1])
+    sh.glabel(sw1_in[0] - 14, sw1_in[1], "+12V_F12_BRAKE", 180)
+    sh.text(sw1_in[0] - 12, sw1_in[1] - 4, "From F12 (10A)", 0.9)
 
     # Brake switch → brake lights
-    sh.wire(80 + 11, 120, 150, 120)
-    sh.wire(150, 120, 150, 100)
-    sh.wire(150, 100, 215, 100)
-    sh.wire(150, 120, 215, 120)
-    sh.wire(150, 120, 150, 145)
-    sh.wire(150, 145, 215, 145)
-    sh.junction(150, 120)
+    sw1_out = sh.p("SW1", "OUT")
+    ds3_p = sh.p("DS3", "+")
+    ds4_p = sh.p("DS4", "+")
+    ds5_p = sh.p("DS5", "+")
+    sh.wire(*sw1_out, 150, sw1_out[1])
+    sh.wire(150, sw1_out[1], 150, ds3_p[1])
+    sh.wire(150, ds3_p[1], *ds3_p)
+    sh.wire(150, sw1_out[1], *ds4_p)
+    sh.wire(150, sw1_out[1], 150, ds5_p[1])
+    sh.wire(150, ds5_p[1], *ds5_p)
+    sh.junction(150, sw1_out[1])
 
     # Brake switch also feeds secondary fuse F20
-    sh.glabel(80 - 25, 130, "+12V_F20_BRAKE2", 180)
-    sh.text(80 - 23, 133, "Alt feed from F20 (15A)", 0.9)
+    sh.glabel(sw1_in[0] - 14, sw1_in[1] + 10, "+12V_F20_BRAKE2", 180)
+    sh.text(sw1_in[0] - 12, sw1_in[1] + 13, "Alt feed from F20 (15A)", 0.9)
 
     # All bulb grounds
-    for y in [40, 60, 100, 120, 145, 175, 195, 225]:
-        sh.wire(225, y, 240, y)
-        sh.glabel(240, y, "GND", 0, "input")
+    for ref in ["DS1", "DS2", "DS3", "DS4", "DS5", "DS6", "DS7", "DS8"]:
+        nx, ny = sh.p(ref, "-")
+        sh.wire(nx, ny, nx + 15, ny)
+        sh.glabel(nx + 15, ny, "GND", 0, "input")
 
     # Turn signal feeds
-    sh.wire(215, 175, 180, 175)
-    sh.glabel(180, 175, "TURN_SIG_LH_REAR", 180)
-    sh.wire(215, 195, 180, 195)
-    sh.glabel(180, 195, "TURN_SIG_RH_REAR", 180)
+    ds6_p = sh.p("DS6", "+")
+    sh.wire(*ds6_p, ds6_p[0] - 35, ds6_p[1])
+    sh.glabel(ds6_p[0] - 35, ds6_p[1], "TURN_SIG_LH_REAR", 180)
+    ds7_p = sh.p("DS7", "+")
+    sh.wire(*ds7_p, ds7_p[0] - 35, ds7_p[1])
+    sh.glabel(ds7_p[0] - 35, ds7_p[1], "TURN_SIG_RH_REAR", 180)
 
     # Rear fog
-    sh.wire(215, 225, 180, 225)
-    sh.glabel(180, 225, "+12V_F21_FOGR", 180)
-    sh.text(182, 221, "From F21 (5A)", 0.9)
+    ds8_p = sh.p("DS8", "+")
+    sh.wire(*ds8_p, ds8_p[0] - 35, ds8_p[1])
+    sh.glabel(ds8_p[0] - 35, ds8_p[1], "+12V_F21_FOGR", 180)
+    sh.text(ds8_p[0] - 33, ds8_p[1] - 4, "From F21 (5A)", 0.9)
 
     # Control lamp
-    sh.wire(350 - 7, 120, 350 - 18, 120)
-    sh.glabel(350 - 18, 120, "BRAKE_LIGHT_FEED", 180)
-    sh.wire(350 + 7, 120, 350 + 18, 120)
-    sh.glabel(350 + 18, 120, "GND", 0, "input")
+    ds9_p = sh.p("DS9", "+")
+    ds9_n = sh.p("DS9", "-")
+    sh.wire(*ds9_p, ds9_p[0] - 11, ds9_p[1])
+    sh.glabel(ds9_p[0] - 11, ds9_p[1], "BRAKE_LIGHT_FEED", 180)
+    sh.wire(*ds9_n, ds9_n[0] + 11, ds9_n[1])
+    sh.glabel(ds9_n[0] + 11, ds9_n[1], "GND", 0, "input")
 
     # -- Annotations --
     sh.text(30, 255, "REAR LIGHTS", 1.8)
@@ -1514,91 +1628,113 @@ def build_s09_signals_horn():
 
     # -- Wiring --
     # Horn power
-    sh.wire(80 - 10, 40, 80 - 25, 40)
-    sh.glabel(80 - 25, 40, "+12V_F9_HORN_DOME", 180)
-    sh.wire(80 + 10, 40, 80 + 25, 40)
-    sh.glabel(80 + 25, 40, "GND", 0, "input")
+    hz_p = sh.p("BZ1", "+")
+    hz_n = sh.p("BZ1", "-")
+    sh.wire(*hz_p, hz_p[0] - 15, hz_p[1])
+    sh.glabel(hz_p[0] - 15, hz_p[1], "+12V_F9_HORN_DOME", 180)
+    sh.wire(*hz_n, hz_n[0] + 15, hz_n[1])
+    sh.glabel(hz_n[0] + 15, hz_n[1], "GND", 0, "input")
 
     # Horn contact
-    sh.wire(80 - 8, 70, 80 - 25, 70)
-    sh.glabel(80 - 25, 70, "+12V_F9_HORN_DOME", 180)
-    sh.wire(80 + 8, 70, 80 + 25, 70)
-    sh.label(80 + 25, 70, "HORN_ACTIVE")
+    hc_in = sh.p("SW1", "IN")
+    hc_out = sh.p("SW1", "OUT")
+    sh.wire(*hc_in, hc_in[0] - 17, hc_in[1])
+    sh.glabel(hc_in[0] - 17, hc_in[1], "+12V_F9_HORN_DOME", 180)
+    sh.wire(*hc_out, hc_out[0] + 17, hc_out[1])
+    sh.label(hc_out[0] + 17, hc_out[1], "HORN_ACTIVE")
 
     # Flasher relay input
-    sh.wire(180 - 11, 40 - 4, 180 - 25, 36)
-    sh.glabel(180 - 25, 36, "+12V_F24_TURNSIG", 180)
-    sh.text(180 - 23, 32, "From F24 (20A)", 0.9)
-    sh.wire(180 - 11, 40 + 4, 180 - 25, 44)
-    sh.glabel(180 - 25, 44, "GND", 180, "input")
+    fr_49 = sh.p("K1", "49_IN")
+    fr_31 = sh.p("K1", "31_GND")
+    sh.wire(*fr_49, fr_49[0] - 14, fr_49[1])
+    sh.glabel(fr_49[0] - 14, fr_49[1], "+12V_F24_TURNSIG", 180)
+    sh.text(fr_49[0] - 12, fr_49[1] - 4, "From F24 (20A)", 0.9)
+    sh.wire(*fr_31, fr_31[0] - 14, fr_31[1])
+    sh.glabel(fr_31[0] - 14, fr_31[1], "GND", 180, "input")
 
     # Flasher relay → turn signal switch
-    sh.wire(180 + 11, 36, 200, 36)
-    sh.wire(200, 36, 200, 100)
-    sh.wire(200, 100, 180 - 12, 110)
+    fr_out = sh.p("K1", "49a_OUT")
+    ts_in = sh.p("SW2", "IN")
+    sh.wire(*fr_out, 200, fr_out[1])
+    sh.wire(200, fr_out[1], 200, ts_in[1])
+    sh.wire(200, ts_in[1], *ts_in)
 
     # Turn signal switch → left bulbs
-    sh.wire(180 + 12, 110 - 4, 250, 106)
-    sh.wire(250, 106, 250, 80)
-    sh.wire(250, 80, 295, 80)
-    sh.wire(250, 106, 250, 125)
-    sh.wire(250, 125, 295, 125)
-    sh.wire(250, 125, 250, 170)
-    sh.wire(250, 170, 295, 170)
-    sh.junction(250, 106)
-    sh.junction(250, 125)
+    ts_left = sh.p("SW2", "LEFT")
+    ds1_p = sh.p("DS1", "+")
+    ds3_p = sh.p("DS3", "+")
+    ds5_p = sh.p("DS5", "+")
+    sh.wire(*ts_left, 250, ts_left[1])
+    sh.wire(250, ts_left[1], 250, ds1_p[1])
+    sh.wire(250, ds1_p[1], *ds1_p)
+    sh.wire(250, ts_left[1], 250, ds3_p[1])
+    sh.wire(250, ds3_p[1], *ds3_p)
+    sh.wire(250, ds3_p[1], 250, ds5_p[1])
+    sh.wire(250, ds5_p[1], *ds5_p)
+    sh.junction(250, ts_left[1])
+    sh.junction(250, ds3_p[1])
 
     # Turn signal switch → right bulbs
-    sh.wire(180 + 12, 110 + 4, 270, 114)
-    sh.wire(270, 114, 270, 100)
-    sh.wire(270, 100, 295, 100)
-    sh.wire(270, 114, 270, 145)
-    sh.wire(270, 145, 295, 145)
-    sh.wire(270, 145, 270, 190)
-    sh.wire(270, 190, 295, 190)
-    sh.junction(270, 114)
-    sh.junction(270, 145)
+    ts_right = sh.p("SW2", "RIGHT")
+    ds2_p = sh.p("DS2", "+")
+    ds4_p = sh.p("DS4", "+")
+    ds6_p = sh.p("DS6", "+")
+    sh.wire(*ts_right, 270, ts_right[1])
+    sh.wire(270, ts_right[1], 270, ds2_p[1])
+    sh.wire(270, ds2_p[1], *ds2_p)
+    sh.wire(270, ts_right[1], 270, ds4_p[1])
+    sh.wire(270, ds4_p[1], *ds4_p)
+    sh.wire(270, ds4_p[1], 270, ds6_p[1])
+    sh.wire(270, ds6_p[1], *ds6_p)
+    sh.junction(270, ts_right[1])
+    sh.junction(270, ds4_p[1])
 
     # Hazard switch
-    sh.wire(180, 110 - 14, 180, 110 - 25)
-    sh.glabel(180, 110 - 25, "+12V_F24_TURNSIG", 90)
+    ts_haz = sh.p("SW2", "HAZARD")
+    sh.wire(*ts_haz, ts_haz[0], ts_haz[1] - 11)
+    sh.glabel(ts_haz[0], ts_haz[1] - 11, "+12V_F24_TURNSIG", 90)
 
     # All bulb grounds
-    for y in [80, 100, 125, 145, 170, 190]:
-        sh.wire(305, y, 320, y)
-        sh.glabel(320, y, "GND", 0, "input")
+    for ref in ["DS1", "DS2", "DS3", "DS4", "DS5", "DS6"]:
+        nx, ny = sh.p(ref, "-")
+        sh.wire(nx, ny, nx + 15, ny)
+        sh.glabel(nx + 15, ny, "GND", 0, "input")
 
     # Global labels for turn signal rear (cross-sheet with S08)
-    sh.glabel(295, 170, "TURN_SIG_LH_REAR", 180)
-    sh.glabel(295, 190, "TURN_SIG_RH_REAR", 180)
+    sh.glabel(ds5_p[0], ds5_p[1], "TURN_SIG_LH_REAR", 180)
+    sh.glabel(ds6_p[0], ds6_p[1], "TURN_SIG_RH_REAR", 180)
 
     # Dome light
-    sh.wire(80 - 9, 170, 80 - 25, 170)
-    sh.glabel(80 - 25, 170, "+12V_F9_HORN_DOME", 180)
-    sh.wire(80 + 9, 170, 80 + 25, 170)
-    sh.label(80 + 25, 170, "DOME_SW")
+    dl_p = sh.p("DS7", "+")
+    dl_n = sh.p("DS7", "-")
+    sh.wire(*dl_p, dl_p[0] - 16, dl_p[1])
+    sh.glabel(dl_p[0] - 16, dl_p[1], "+12V_F9_HORN_DOME", 180)
+    sh.wire(*dl_n, dl_n[0] + 16, dl_n[1])
+    sh.label(dl_n[0] + 16, dl_n[1], "DOME_SW")
 
     # Door switches → dome light control
-    sh.wire(80 - 8, 200, 80 - 25, 200)
-    sh.glabel(80 - 25, 200, "DOOR_SW_DRIVER", 180)
-    sh.wire(80 + 8, 200, 80 + 25, 200)
-    sh.glabel(80 + 25, 200, "DOME_SW", 0)
-
-    sh.wire(80 - 8, 220, 80 - 25, 220)
-    sh.glabel(80 - 25, 220, "DOOR_SW_PASS", 180)
-    sh.wire(80 + 8, 220, 80 + 25, 220)
-    sh.glabel(80 + 25, 220, "DOME_SW", 0)
+    for ref, sig_l, sig_r in [("SW3", "DOOR_SW_DRIVER", "DOME_SW"),
+                               ("SW4", "DOOR_SW_PASS", "DOME_SW")]:
+        pin_l = sh.p(ref, "COM")
+        pin_r = sh.p(ref, "NO")
+        sh.wire(*pin_l, pin_l[0] - 17, pin_l[1])
+        sh.glabel(pin_l[0] - 17, pin_l[1], sig_l, 180)
+        sh.wire(*pin_r, pin_r[0] + 17, pin_r[1])
+        sh.glabel(pin_r[0] + 17, pin_r[1], sig_r, 0)
 
     # Tailgate switch
-    sh.wire(80 - 9, 245, 80 - 25, 245)
-    sh.glabel(80 - 25, 245, "TAILGATE_SW", 180)
+    sw5_a = sh.p("SW5", "A")
+    sh.wire(*sw5_a, sw5_a[0] - 16, sw5_a[1])
+    sh.glabel(sw5_a[0] - 16, sw5_a[1], "TAILGATE_SW", 180)
 
     # Power outlet
-    sh.wire(300 - 9, 230, 300 - 25, 230)
-    sh.glabel(300 - 25, 230, "+12V_F8_OUTLET", 180)
-    sh.wire(300 + 9, 230, 300 + 25, 230)
-    sh.glabel(300 + 25, 230, "GND", 0, "input")
-    sh.text(300 - 23, 226, "From F8 (25A)", 0.9)
+    j1_p = sh.p("J1", "+")
+    j1_n = sh.p("J1", "-")
+    sh.wire(*j1_p, j1_p[0] - 16, j1_p[1])
+    sh.glabel(j1_p[0] - 16, j1_p[1], "+12V_F8_OUTLET", 180)
+    sh.wire(*j1_n, j1_n[0] + 16, j1_n[1])
+    sh.glabel(j1_n[0] + 16, j1_n[1], "GND", 0, "input")
+    sh.text(j1_p[0] - 14, j1_p[1] - 4, "From F8 (25A)", 0.9)
 
     # -- Annotations --
     sh.text(30, 265, "TURN SIGNALS, HORN & INTERIOR", 1.8)
@@ -1672,72 +1808,89 @@ def build_s10_wipers_alarm():
 
     # -- Wiring --
     # Wiper switch input
-    sh.wire(WSW_X - 14, WSW_Y, WSW_X - 30, WSW_Y)
-    sh.glabel(WSW_X - 30, WSW_Y, "+12V_F14_WIPER", 180)
-    sh.text(WSW_X - 28, WSW_Y - 4, "From F14 (25A)", 0.9)
+    wsw_in = sh.p("SW1", "BAT_IN")
+    sh.wire(*wsw_in, wsw_in[0] - 16, wsw_in[1])
+    sh.glabel(wsw_in[0] - 16, wsw_in[1], "+12V_F14_WIPER", 180)
+    sh.text(wsw_in[0] - 14, wsw_in[1] - 4, "From F14 (25A)", 0.9)
 
-    # Wiper switch → relay
-    sp_w = 30 / 6
-    sh.wire(WSW_X + 14, WSW_Y - sp_w, 151, 50 - 4)
+    # Wiper switch INTERVAL → relay coil
+    wsw_intv = sh.p("SW1", "INTERVAL")
+    k1_cp = sh.p("K1", "86_COIL+")
+    sh.wire(*wsw_intv, *k1_cp)
 
-    # Wiper relay → motor
-    sh.wire(160 + 11, 50 - 4, WM_X - 12, WM_Y - 5)
-    sh.wire(160 + 11, 50, WM_X - 12, WM_Y)
+    # Wiper relay → motor PARK/SLOW
+    k1_com = sh.p("K1", "30_COM")
+    k1_no = sh.p("K1", "87_NO")
+    wm_park = sh.p("M1", "PARK")
+    wm_slow = sh.p("M1", "SLOW")
+    sh.wire(*k1_com, *wm_park)
+    sh.wire(*k1_no, *wm_slow)
 
     # Wiper motor fast speed
-    sh.wire(WSW_X + 14, WSW_Y + 2 * sp_w, 200, WSW_Y + 2 * sp_w)
-    sh.wire(200, WSW_Y + 2 * sp_w, WM_X - 12, WM_Y + 5)
+    wsw_fast = sh.p("SW1", "FAST")
+    wm_fast = sh.p("M1", "FAST")
+    sh.wire(*wsw_fast, 200, wsw_fast[1])
+    sh.wire(200, wsw_fast[1], *wm_fast)
 
-    # Wiper motor GND
-    sh.wire(WM_X + 12, WM_Y + 5, WM_X + 25, WM_Y + 5)
-    sh.glabel(WM_X + 25, WM_Y + 5, "GND", 0, "input")
-    sh.wire(WM_X + 12, WM_Y - 5, WM_X + 25, WM_Y - 5)
-    sh.label(WM_X + 25, WM_Y - 5, "WIPER_COM")
+    # Wiper motor right side
+    wm_com = sh.p("M1", "COM")
+    wm_gnd = sh.p("M1", "GND")
+    sh.wire(*wm_gnd, wm_gnd[0] + 13, wm_gnd[1])
+    sh.glabel(wm_gnd[0] + 13, wm_gnd[1], "GND", 0, "input")
+    sh.wire(*wm_com, wm_com[0] + 13, wm_com[1])
+    sh.label(wm_com[0] + 13, wm_com[1], "WIPER_COM")
 
     # Washer pump
-    sh.wire(260 - 9, 110, 260 - 25, 110)
-    sh.glabel(260 - 25, 110, "+12V_F14_WIPER", 180)
-    sh.wire(260 + 9, 110, 260 + 25, 110)
-    sh.glabel(260 + 25, 110, "GND", 0, "input")
+    m2_p = sh.p("M2", "+")
+    m2_n = sh.p("M2", "-")
+    sh.wire(*m2_p, m2_p[0] - 16, m2_p[1])
+    sh.glabel(m2_p[0] - 16, m2_p[1], "+12V_F14_WIPER", 180)
+    sh.wire(*m2_n, m2_n[0] + 16, m2_n[1])
+    sh.glabel(m2_n[0] + 16, m2_n[1], "GND", 0, "input")
 
-    # Alarm unit connections
-    alm_l = ["DOOR_DR", "DOOR_PS", "TAILGATE", "+12V_BAT"]
-    sp_a = 40 / (4 + 1)
-    for i, sig in enumerate(alm_l):
-        py = ALM_Y - 20 + sp_a * (i + 1)
-        sh.wire(ALM_X - 17, py, ALM_X - 30, py)
-        if sig == "+12V_BAT":
-            sh.glabel(ALM_X - 30, py, "+12V_F17_COLL_ALM", 180)
-        else:
-            sh.glabel(ALM_X - 30, py, sig, 180)
+    # Alarm unit left connections
+    alm_l_map = [("DOOR_DR", "DOOR_DR"), ("DOOR_PS", "DOOR_PS"),
+                 ("TAILGATE", "TAILGATE"), ("+12V_BAT", "+12V_F17_COLL_ALM")]
+    for pin, sig in alm_l_map:
+        px, py = sh.p("U1", pin)
+        sh.wire(px, py, px - 13, py)
+        sh.glabel(px - 13, py, sig, 180)
 
-    alm_r = ["SIREN_OUT", "TURN_SIG_ALARM", "IGN_SENSE", "DOOR_LOCK", "DOOR_UNLOCK"]
-    sp_ar = 40 / (5 + 1)
-    for i, sig in enumerate(alm_r):
-        py = ALM_Y - 20 + sp_ar * (i + 1)
-        sh.wire(ALM_X + 17, py, ALM_X + 30, py)
-        sh.glabel(ALM_X + 30, py, sig, 0)
+    # Alarm unit right connections
+    alm_r_map = [("SIREN", "SIREN_OUT"), ("TURN_SIG", "TURN_SIG_ALARM"),
+                 ("IGN_SENSE", "IGN_SENSE"), ("LOCK", "DOOR_LOCK"), ("UNLOCK", "DOOR_UNLOCK")]
+    for pin, sig in alm_r_map:
+        px, py = sh.p("U1", pin)
+        sh.wire(px, py, px + 13, py)
+        sh.glabel(px + 13, py, sig, 0)
 
-    sh.wire(ALM_X, ALM_Y + 22, ALM_X, ALM_Y + 32)
-    sh.glabel(ALM_X, ALM_Y + 32, "GND", 270, "input")
+    # Alarm GND
+    alm_gnd = sh.p("U1", "GND")
+    sh.wire(*alm_gnd, alm_gnd[0], alm_gnd[1] + 10)
+    sh.glabel(alm_gnd[0], alm_gnd[1] + 10, "GND", 270, "input")
 
     # Siren
-    sh.wire(260 - 9, 210, 260 - 22, 210)
-    sh.glabel(260 - 22, 210, "SIREN_OUT", 180)
-    sh.wire(260 + 9, 210, 260 + 22, 210)
-    sh.glabel(260 + 22, 210, "GND", 0, "input")
+    bz_p = sh.p("BZ1", "+")
+    bz_n = sh.p("BZ1", "-")
+    sh.wire(*bz_p, bz_p[0] - 13, bz_p[1])
+    sh.glabel(bz_p[0] - 13, bz_p[1], "SIREN_OUT", 180)
+    sh.wire(*bz_n, bz_n[0] + 13, bz_n[1])
+    sh.glabel(bz_n[0] + 13, bz_n[1], "GND", 0, "input")
 
     # Tailgate release relay
-    sh.wire(260 - 11, 170 - 4, 260 - 25, 166)
-    sh.glabel(260 - 25, 166, "+12V_F9_HORN_DOME", 180)
-    sh.text(260 - 23, 162, "From F9 (15A)", 0.9)
-    sh.wire(260 + 11, 170 - 4, 260 + 25, 166)
-    sh.glabel(260 + 25, 166, "TAILGATE_RELEASE", 0)
+    k2_cp = sh.p("K2", "86_COIL+")
+    k2_cn = sh.p("K2", "85_COIL-")
+    sh.wire(*k2_cp, k2_cp[0] - 14, k2_cp[1])
+    sh.glabel(k2_cp[0] - 14, k2_cp[1], "+12V_F9_HORN_DOME", 180)
+    sh.text(k2_cp[0] - 12, k2_cp[1] - 4, "From F9 (15A)", 0.9)
+    k2_com = sh.p("K2", "30_COM")
+    sh.wire(*k2_com, k2_com[0] + 14, k2_com[1])
+    sh.glabel(k2_com[0] + 14, k2_com[1], "TAILGATE_RELEASE", 0)
 
-    # Door switch globals
-    sh.glabel(ALM_X - 30, ALM_Y - 12, "DOOR_SW_DRIVER", 180)
-    sh.glabel(ALM_X - 30, ALM_Y - 4, "DOOR_SW_PASS", 180)
-    sh.glabel(ALM_X - 30, ALM_Y + 4, "TAILGATE_SW", 180)
+    # Door switch globals (additional references for alarm cross-wiring)
+    sh.glabel(sh.p("U1", "DOOR_DR")[0] - 13, sh.p("U1", "DOOR_DR")[1] - 8, "DOOR_SW_DRIVER", 180)
+    sh.glabel(sh.p("U1", "DOOR_PS")[0] - 13, sh.p("U1", "DOOR_PS")[1] - 8, "DOOR_SW_PASS", 180)
+    sh.glabel(sh.p("U1", "TAILGATE")[0] - 13, sh.p("U1", "TAILGATE")[1] - 8, "TAILGATE_SW", 180)
 
     # -- Annotations --
     sh.text(30, 245, "WIPERS & ALARM SYSTEM", 1.8)
@@ -1805,68 +1958,71 @@ def build_s11_diag_speed():
     sh.place("Think:SPEEDOMETER", "U2", "Speed Signal", 300, 220)
 
     # -- Diagnostic connector wiring --
-    # K-LINE
-    dc_l_sp = 42 / 9
-    kline_y = DC_Y - 21 + dc_l_sp * 7
-    sh.wire(DC_X - 16, kline_y, DC_X - 30, kline_y)
-    sh.glabel(DC_X - 30, kline_y, "K_LINE", 180)
-    sh.text(DC_X - 28, kline_y - 3, "Pin 7: K-LINE", 0.9)
+    # K-LINE (left pin 7)
+    kl = sh.p("J1", "PIN7_KLINE")
+    sh.wire(*kl, kl[0] - 14, kl[1])
+    sh.glabel(kl[0] - 14, kl[1], "K_LINE", 180)
+    sh.text(kl[0] - 12, kl[1] - 3, "Pin 7: K-LINE", 0.9)
 
     # L-LINE (right side pin 15)
-    dc_r_sp = 42 / 9
-    lline_y = DC_Y - 21 + dc_r_sp * 7
-    sh.wire(DC_X + 16, lline_y, DC_X + 30, lline_y)
-    sh.glabel(DC_X + 30, lline_y, "L_LINE", 0)
-    sh.text(DC_X + 32, lline_y - 3, "Pin 15: L-LINE", 0.9)
+    ll = sh.p("J1", "PIN15_LLINE")
+    sh.wire(*ll, ll[0] + 14, ll[1])
+    sh.glabel(ll[0] + 14, ll[1], "L_LINE", 0)
+    sh.text(ll[0] + 16, ll[1] - 3, "Pin 15: L-LINE", 0.9)
 
     # +12V_BAT (right side pin 16)
-    bat_y = DC_Y - 21 + dc_r_sp * 8
-    sh.wire(DC_X + 16, bat_y, DC_X + 30, bat_y)
-    sh.glabel(DC_X + 30, bat_y, "+12V_ALWAYS", 0)
-    sh.text(DC_X + 32, bat_y - 3, "Pin 16: +12V_BAT", 0.9)
+    bat = sh.p("J1", "PIN16_BAT")
+    sh.wire(*bat, bat[0] + 14, bat[1])
+    sh.glabel(bat[0] + 14, bat[1], "+12V_ALWAYS", 0)
+    sh.text(bat[0] + 16, bat[1] - 3, "Pin 16: +12V_BAT", 0.9)
 
-    # Signal ground
-    gnd_y = DC_Y - 21 + dc_l_sp * 5
-    sh.wire(DC_X - 16, gnd_y, DC_X - 30, gnd_y)
-    sh.glabel(DC_X - 30, gnd_y, "GND", 180, "input")
-    sh.text(DC_X - 28, gnd_y - 3, "Pin 5: Signal GND", 0.9)
+    # Signal ground (left pin 5)
+    gnd = sh.p("J1", "PIN5")
+    sh.wire(*gnd, gnd[0] - 14, gnd[1])
+    sh.glabel(gnd[0] - 14, gnd[1], "GND", 180, "input")
+    sh.text(gnd[0] - 12, gnd[1] - 3, "Pin 5: Signal GND", 0.9)
 
-    # Multi-connector
+    # Multi-connector left
+    mc_l_pins = ["D01_1", "D01_2", "D01_3", "D01_4", "D01_5"]
     mc_l_sigs = ["DRIVE", "START", "DRIVE_RDY", "FAULT", "RED_PWR"]
-    mc_l_sp = 30 / 6
-    for i, sig in enumerate(mc_l_sigs):
-        py = MC_Y - 15 + mc_l_sp * (i + 1)
-        sh.wire(MC_X - 14, py, MC_X - 30, py)
-        sh.glabel(MC_X - 30, py, sig, 180)
+    for pin, sig in zip(mc_l_pins, mc_l_sigs):
+        px, py = sh.p("J2", pin)
+        sh.wire(px, py, px - 16, py)
+        sh.glabel(px - 16, py, sig, 180)
 
+    # Multi-connector right
+    mc_r_pins = ["D02_1", "D02_2", "D02_3", "D02_4", "D02_5"]
     mc_r_sigs = ["BRAKE_SW", "REVERSE", "GEAR_LOCK", "RAD_FAN_CMD", "POWER"]
-    for i, sig in enumerate(mc_r_sigs):
-        py = MC_Y - 15 + mc_l_sp * (i + 1)
-        sh.wire(MC_X + 14, py, MC_X + 30, py)
-        sh.glabel(MC_X + 30, py, sig, 0)
+    for pin, sig in zip(mc_r_pins, mc_r_sigs):
+        px, py = sh.p("J2", pin)
+        sh.wire(px, py, px + 16, py)
+        sh.glabel(px + 16, py, sig, 0)
 
     # Collision sensor
-    sh.wire(CS_X - 14, CS_Y - 3, CS_X - 28, CS_Y - 3)
-    sh.glabel(CS_X - 28, CS_Y - 3, "K_LINE", 180)
-    sh.wire(CS_X - 14, CS_Y + 3, CS_X - 28, CS_Y + 3)
-    sh.glabel(CS_X - 28, CS_Y + 3, "+12V_F17_COLL_ALM", 180)
-
-    sh.wire(CS_X + 14, CS_Y - 3, CS_X + 28, CS_Y - 3)
-    sh.glabel(CS_X + 28, CS_Y - 3, "GND", 0, "input")
-    sh.wire(CS_X + 14, CS_Y + 3, CS_X + 28, CS_Y + 3)
-    sh.glabel(CS_X + 28, CS_Y + 3, "CRASH_SIGNAL", 0)
+    for pin, sig, dx, shape in [
+        ("KLINE", "K_LINE", -14, "bidirectional"),
+        ("+12V", "+12V_F17_COLL_ALM", -14, "bidirectional"),
+        ("GND", "GND", 14, "input"),
+        ("CRASH_OUT", "CRASH_SIGNAL", 14, "bidirectional"),
+    ]:
+        px, py = sh.p("U1", pin)
+        sh.wire(px, py, px + dx, py)
+        sh.glabel(px + dx, py, sig, 180 if dx < 0 else 0, shape)
 
     # Charge cooling relay
-    sh.wire(300 - 11, 180 - 4, 300 - 25, 176)
-    sh.glabel(300 - 25, 176, "BATT_COOLING", 180)
-    sh.wire(300 + 11, 180 - 4, 300 + 25, 176)
-    sh.glabel(300 + 25, 176, "+12V_F10_WPUMP_CHG", 0)
+    k1_cp = sh.p("K1", "86_COIL+")
+    k1_cn = sh.p("K1", "85_COIL-")
+    sh.wire(*k1_cp, k1_cp[0] - 14, k1_cp[1])
+    sh.glabel(k1_cp[0] - 14, k1_cp[1], "BATT_COOLING", 180)
+    k1_com = sh.p("K1", "30_COM")
+    sh.wire(*k1_com, k1_com[0] + 14, k1_com[1])
+    sh.glabel(k1_com[0] + 14, k1_com[1], "+12V_F10_WPUMP_CHG", 0)
 
     # Speed signal
-    sh.wire(300 - 12, 220 - 3, 300 - 25, 217)
-    sh.glabel(300 - 25, 217, "SPEED_SIGNAL", 180)
-    sh.wire(300 - 12, 220 + 3, 300 - 25, 223)
-    sh.glabel(300 - 25, 223, "+12V_F30_DIAG", 180)
+    for pin, sig, dx in [("SPEED_IN", "SPEED_SIGNAL", -13), ("+12V", "+12V_F30_DIAG", -13)]:
+        px, py = sh.p("U2", pin)
+        sh.wire(px, py, px + dx, py)
+        sh.glabel(px + dx, py, sig, 180)
 
     # -- Annotations --
     sh.text(30, 255, "DIAGNOSTICS & SPEED", 1.8)
@@ -1983,85 +2139,116 @@ def build_s12_radio_hvac():
 
     # -- Wiring --
     # Radio power
-    sh.wire(80 - 14, 50 - 5, 80 - 28, 45)
-    sh.glabel(80 - 28, 45, "+12V_F7_RADIO", 180)
-    sh.wire(80 - 14, 50, 80 - 28, 50)
-    sh.glabel(80 - 28, 50, "GND", 180, "input")
+    r_12v = sh.p("U1", "+12V_BAT")
+    r_gnd = sh.p("U1", "GND")
+    sh.wire(*r_12v, r_12v[0] - 14, r_12v[1])
+    sh.glabel(r_12v[0] - 14, r_12v[1], "+12V_F7_RADIO", 180)
+    sh.wire(*r_gnd, r_gnd[0] - 14, r_gnd[1])
+    sh.glabel(r_gnd[0] - 14, r_gnd[1], "GND", 180, "input")
 
     # Radio → speakers
-    sh.wire(80 + 14, 50 - 7, 195, 35)
-    sh.wire(80 + 14, 50 - 3, 195, 35)
-    sh.wire(80 + 14, 50 + 2, 195, 55)
-    sh.wire(80 + 14, 50 + 6, 195, 55)
+    for rpin, sref in [("SPK_L+", "LS1"), ("SPK_L-", "LS1"),
+                        ("SPK_R+", "LS2"), ("SPK_R-", "LS2")]:
+        rx, ry = sh.p("U1", rpin)
+        spin = "+" if "+" in rpin else "-"
+        sx, sy = sh.p(sref, spin)
+        sh.wire(rx, ry, sx, sy)
 
     # Speaker GND
-    sh.wire(205, 35, 220, 35)
-    sh.glabel(220, 35, "GND", 0, "input")
-    sh.wire(205, 55, 220, 55)
-    sh.glabel(220, 55, "GND", 0, "input")
+    for ref in ["LS1", "LS2"]:
+        nx, ny = sh.p(ref, "-")
+        sh.wire(nx, ny, nx + 15, ny)
+        sh.glabel(nx + 15, ny, "GND", 0, "input")
 
     # Antenna
-    sh.wire(80 - 7, 20, 80 - 20, 20)
-    sh.label(80 - 20, 17, "ANT_SIGNAL")
-    sh.wire(80 - 14, 50 + 10, 80 - 14, 20)
+    an_sig = sh.p("AN1", "SIG")
+    sh.wire(*an_sig, an_sig[0] - 13, an_sig[1])
+    sh.label(an_sig[0] - 13, an_sig[1] - 3, "ANT_SIGNAL")
+    r_ant = sh.p("U1", "ANT")
+    sh.wire(*r_ant, r_ant[0], an_sig[1])
 
     # Heated rear window relay → element
-    sh.wire(140 - 11, 90 - 4, 140 - 25, 86)
-    sh.glabel(140 - 25, 86, "+12V_F1_HTDWS", 180)
-    sh.text(140 - 23, 82, "From F1 (30A)", 0.9)
-    sh.wire(140 + 11, 90 - 4, 195, 90)
-    sh.wire(200 + 12, 90, 220, 90)
-    sh.glabel(220, 90, "GND", 0, "input")
+    k1_cp = sh.p("K1", "86_COIL+")
+    sh.wire(*k1_cp, k1_cp[0] - 14, k1_cp[1])
+    sh.glabel(k1_cp[0] - 14, k1_cp[1], "+12V_F1_HTDWS", 180)
+    sh.text(k1_cp[0] - 12, k1_cp[1] - 4, "From F1 (30A)", 0.9)
+    k1_com = sh.p("K1", "30_COM")
+    hr_12v = sh.p("HR1", "+12V")
+    sh.wire(*k1_com, *hr_12v)
+    hr_gnd = sh.p("HR1", "GND")
+    sh.wire(*hr_gnd, hr_gnd[0] + 12, hr_gnd[1])
+    sh.glabel(hr_gnd[0] + 12, hr_gnd[1], "GND", 0, "input")
 
     # Brake vacuum pump
-    sh.wire(80 - 11, 120, 80 - 25, 120)
-    sh.glabel(80 - 25, 120, "+12V_F22_VACPUMP", 180)
-    sh.text(80 - 23, 116, "From F22 (25A)", 0.9)
-    sh.wire(80 + 11, 120, 80 + 25, 120)
-    sh.glabel(80 + 25, 120, "GND", 0, "input")
+    vp_p = sh.p("M1", "+")
+    vp_n = sh.p("M1", "-")
+    sh.wire(*vp_p, vp_p[0] - 14, vp_p[1])
+    sh.glabel(vp_p[0] - 14, vp_p[1], "+12V_F22_VACPUMP", 180)
+    sh.text(vp_p[0] - 12, vp_p[1] - 4, "From F22 (25A)", 0.9)
+    sh.wire(*vp_n, vp_n[0] + 14, vp_n[1])
+    sh.glabel(vp_n[0] + 14, vp_n[1], "GND", 0, "input")
 
     # Heater switch → relay → blower
-    sh.wire(80 - 14, 180, 80 - 28, 180)
-    sh.glabel(80 - 28, 180, "+12V_F5_BLOWER", 180)
-    sh.text(80 - 26, 176, "From F5 (30A)", 0.9)
+    hs_in = sh.p("SW1", "IN")
+    sh.wire(*hs_in, hs_in[0] - 14, hs_in[1])
+    sh.glabel(hs_in[0] - 14, hs_in[1], "+12V_F5_BLOWER", 180)
+    sh.text(hs_in[0] - 12, hs_in[1] - 4, "From F5 (30A)", 0.9)
 
-    sh.wire(80 + 14, 180 - 4, 151, 160 - 4)
-    sh.wire(160 + 11, 160 - 4, 245, 160 - 3)
+    hs_spd1 = sh.p("SW1", "SPD1")
+    k2_cp = sh.p("K2", "86_COIL+")
+    sh.wire(*hs_spd1, *k2_cp)
+    k2_com = sh.p("K2", "30_COM")
+    bm_mp = sh.p("M2", "M+")
+    sh.wire(*k2_com, *bm_mp)
 
     # Blower GND
-    sh.wire(250 + 12, 160 + 3, 250 + 25, 163)
-    sh.glabel(250 + 25, 163, "GND", 0, "input")
+    bm_mn = sh.p("M2", "M-")
+    sh.wire(*bm_mn, bm_mn[0] + 13, bm_mn[1])
+    sh.glabel(bm_mn[0] + 13, bm_mn[1], "GND", 0, "input")
 
     # Recirculation
-    sh.wire(80 - 9, 230, 80 - 25, 230)
-    sh.glabel(80 - 25, 230, "+12V_F5_BLOWER", 180)
-    sh.wire(80 + 9, 230, 151, 230)
-    sh.wire(160 + 11, 230 - 4, 245, 240)
-    sh.wire(250 + 10, 240, 270, 240)
-    sh.glabel(270, 240, "GND", 0, "input")
+    sw2_a = sh.p("SW2", "A")
+    sh.wire(*sw2_a, sw2_a[0] - 16, sw2_a[1])
+    sh.glabel(sw2_a[0] - 16, sw2_a[1], "+12V_F5_BLOWER", 180)
+    sw2_b = sh.p("SW2", "B")
+    k3_cp = sh.p("K3", "86_COIL+")
+    sh.wire(*sw2_b, *k3_cp)
+    k3_com = sh.p("K3", "30_COM")
+    rm_p = sh.p("M3", "M+")
+    sh.wire(*k3_com, *rm_p)
+    rm_n = sh.p("M3", "M-")
+    sh.wire(*rm_n, rm_n[0] + 12, rm_n[1])
+    sh.glabel(rm_n[0] + 12, rm_n[1], "GND", 0, "input")
 
     # Webasto heater
-    sh.wire(350 - 14, 100 - 5, 350 - 28, 95)
-    sh.glabel(350 - 28, 95, "+12V_F3_HEATER", 180)
-    sh.text(350 - 26, 91, "From F3 (40A)", 0.9)
-    sh.wire(350 - 14, 100 + 5, 350 - 28, 105)
-    sh.glabel(350 - 28, 105, "GND", 180, "input")
+    wb_12v = sh.p("U2", "+12V")
+    wb_gnd = sh.p("U2", "GND")
+    sh.wire(*wb_12v, wb_12v[0] - 14, wb_12v[1])
+    sh.glabel(wb_12v[0] - 14, wb_12v[1], "+12V_F3_HEATER", 180)
+    sh.text(wb_12v[0] - 12, wb_12v[1] - 4, "From F3 (40A)", 0.9)
+    sh.wire(*wb_gnd, wb_gnd[0] - 14, wb_gnd[1])
+    sh.glabel(wb_gnd[0] - 14, wb_gnd[1], "GND", 180, "input")
 
-    sh.wire(350 + 14, 100 + 2, 350 + 28, 102)
-    sh.glabel(350 + 28, 102, "WEBASTO_CTRL", 0)
+    wb_ctrl = sh.p("U2", "CTRL")
+    sh.wire(*wb_ctrl, wb_ctrl[0] + 14, wb_ctrl[1])
+    sh.glabel(wb_ctrl[0] + 14, wb_ctrl[1], "WEBASTO_CTRL", 0)
 
     # Webasto relay
-    sh.wire(350 - 11, 50 - 4, 350 - 25, 46)
-    sh.glabel(350 - 25, 46, "+12V_F33_WEBASTO", 180)
+    k4_cp = sh.p("K4", "86_COIL+")
+    sh.wire(*k4_cp, k4_cp[0] - 14, k4_cp[1])
+    sh.glabel(k4_cp[0] - 14, k4_cp[1], "+12V_F33_WEBASTO", 180)
 
     # Tailgate release
-    sh.wire(350 - 9, 170, 350 - 22, 170)
-    sh.glabel(350 - 22, 170, "TAILGATE_RELEASE", 180)
-    sh.wire(350 + 9, 170, 350 + 22, 170)
-    sh.glabel(350 + 22, 170, "GND", 0, "input")
+    sol_p = sh.p("SOL1", "+")
+    sol_n = sh.p("SOL1", "-")
+    sh.wire(*sol_p, sol_p[0] - 13, sol_p[1])
+    sh.glabel(sol_p[0] - 13, sol_p[1], "TAILGATE_RELEASE", 180)
+    sh.wire(*sol_n, sol_n[0] + 13, sol_n[1])
+    sh.glabel(sol_n[0] + 13, sol_n[1], "GND", 0, "input")
 
-    sh.wire(350 - 9, 200, 350 - 22, 200)
-    sh.glabel(350 - 22, 200, "+12V_F9_HORN_DOME", 180)
+    sw3_a = sh.p("SW3", "A")
+    sh.wire(*sw3_a, sw3_a[0] - 13, sw3_a[1])
+    sh.glabel(sw3_a[0] - 13, sw3_a[1], "+12V_F9_HORN_DOME", 180)
 
     # -- Annotations --
     sh.text(30, 260, "RADIO, HVAC & AUXILIARY", 1.8)
@@ -2141,94 +2328,97 @@ def build_s13_safety_hv():
     sh.place("Think:HV_DIST_DETAIL", "U3", "HV Distribution Box Detail", HVD_X, HVD_Y)
 
     # -- Collision control wiring --
-    cc_l = ["K_LINE", "+12V_F17_COLL_ALM", "CRASH_SIGNAL"]
-    sp_cc = 30 / 4
-    for i, sig in enumerate(cc_l):
-        py = CC_Y - 15 + sp_cc * (i + 1)
-        sh.wire(CC_X - 17, py, CC_X - 30, py)
-        shape = "bidirectional"
-        if "12V" in sig:
-            shape = "output"
-        sh.glabel(CC_X - 30, py, sig, 180, shape)
+    cc_l_map = [("K_LINE", "K_LINE", "bidirectional"),
+                ("+12V_BAT", "+12V_F17_COLL_ALM", "output"),
+                ("CRASH_IN", "CRASH_SIGNAL", "bidirectional")]
+    for pin, sig, shape in cc_l_map:
+        px, py = sh.p("U1", pin)
+        sh.wire(px, py, px - 13, py)
+        sh.glabel(px - 13, py, sig, 180, shape)
 
     # Collision control right → pretensioners
-    cc_r = ["DRIVER_BELT", "PASS_BELT", "WARNING_LAMP", "GND"]
-    sp_cr = 30 / 5
-    for i, sig in enumerate(cc_r):
-        py = CC_Y - 15 + sp_cr * (i + 1)
-        sh.wire(CC_X + 17, py, CC_X + 30, py)
-        if sig == "DRIVER_BELT":
-            sh.wire(CC_X + 30, py, 245, 45)
-        elif sig == "PASS_BELT":
-            sh.wire(CC_X + 30, py, 245, 65)
-        elif sig == "GND":
-            sh.glabel(CC_X + 30, py, "GND", 0, "input")
+    cc_r_pins = ["DRIVER_BELT", "PASS_BELT", "WARNING_LAMP", "GND"]
+    for pin in cc_r_pins:
+        px, py = sh.p("U1", pin)
+        sh.wire(px, py, px + 13, py)
+        if pin == "DRIVER_BELT":
+            sb1_f = sh.p("SB1", "FIRE+")
+            sh.wire(px + 13, py, *sb1_f)
+        elif pin == "PASS_BELT":
+            sb2_f = sh.p("SB2", "FIRE+")
+            sh.wire(px + 13, py, *sb2_f)
+        elif pin == "GND":
+            sh.glabel(px + 13, py, "GND", 0, "input")
         else:
-            sh.glabel(CC_X + 30, py, sig, 0)
+            sh.glabel(px + 13, py, pin, 0)
 
     # Pretensioner GND
-    sh.wire(255, 45, 270, 45)
-    sh.glabel(270, 45, "GND", 0, "input")
-    sh.wire(255, 65, 270, 65)
-    sh.glabel(270, 65, "GND", 0, "input")
-    sh.text(255, 41, "Wire: 0.5mm2 PNK", 0.9)
+    sb1_n = sh.p("SB1", "FIRE-")
+    sh.wire(*sb1_n, sb1_n[0] + 15, sb1_n[1])
+    sh.glabel(sb1_n[0] + 15, sb1_n[1], "GND", 0, "input")
+    sb2_n = sh.p("SB2", "FIRE-")
+    sh.wire(*sb2_n, sb2_n[0] + 15, sb2_n[1])
+    sh.glabel(sb2_n[0] + 15, sb2_n[1], "GND", 0, "input")
+    sh.text(sb1_n[0] + 5, sb1_n[1] - 4, "Wire: 0.5mm2 PNK", 0.9)
 
     # -- Contactor box internal connections --
     # Left side
-    cb_l = ["+114V_IN", "-114V_IN", "MAIN_RELAY_COIL", "AUX_RELAY_COIL", "HEATER_RELAY_COIL"]
-    sp_cbl = 80 / 6
-    for i, sig in enumerate(cb_l):
-        py = CB_Y - 40 + sp_cbl * (i + 1)
-        sh.wire(CB_X - 32, py, CB_X - 45, py)
-        if "114V" in sig:
-            sh.glabel(CB_X - 45, py, sig.replace("_IN", ""), 180)
+    cb_l_pins = ["+114V_IN", "-114V_IN", "MAIN_RELAY_COIL", "AUX_RELAY_COIL", "HEATER_RELAY_COIL"]
+    for pin in cb_l_pins:
+        px, py = sh.p("U2", pin)
+        sh.wire(px, py, px - 13, py)
+        if "114V" in pin:
+            sh.glabel(px - 13, py, pin.replace("_IN", ""), 180)
         else:
-            sh.label(CB_X - 45, py, sig)
+            sh.label(px - 13, py, pin)
 
     # Right side
-    cb_r = ["+114V_OUT", "-114V_OUT", "PRECHARGE_OUT", "LEM_SENSE+", "LEM_SENSE-"]
-    sp_cbr = 80 / 6
-    for i, sig in enumerate(cb_r):
-        py = CB_Y - 40 + sp_cbr * (i + 1)
-        sh.wire(CB_X + 32, py, CB_X + 45, py)
-        if "114V" in sig:
-            sh.glabel(CB_X + 45, py, sig.replace("_OUT", "_TO_MC"), 0)
-        elif "LEM" in sig:
-            sh.glabel(CB_X + 45, py, sig, 0)
+    cb_r_pins = ["+114V_OUT", "-114V_OUT", "PRECHARGE_OUT", "LEM_SENSE+", "LEM_SENSE-"]
+    for pin in cb_r_pins:
+        px, py = sh.p("U2", pin)
+        sh.wire(px, py, px + 13, py)
+        if "114V" in pin:
+            sh.glabel(px + 13, py, pin.replace("_OUT", "_TO_MC"), 0)
+        elif "LEM" in pin:
+            sh.glabel(px + 13, py, pin, 0)
         else:
-            sh.label(CB_X + 45, py, sig)
+            sh.label(px + 13, py, pin)
 
     # Top control signals
-    cb_t = ["CB_RUN", "BMS_CMD", "CHG_START", "PREHEAT", "CHARGE", "+12V_CTRL"]
-    sp_cbt = 60 / 7
-    for i, sig in enumerate(cb_t):
-        px = CB_X - 30 + sp_cbt * (i + 1) * 2
-        sh.wire(px, CB_Y - 42, px, CB_Y - 55)
-        if sig == "+12V_CTRL":
-            sh.glabel(px, CB_Y - 55, "+12V_F28_DRIVE", 90)
+    cb_t_pins = ["CB_RUN", "BMS_CMD", "CHG_START", "PREHEAT", "CHARGE", "+12V_CTRL"]
+    for pin in cb_t_pins:
+        px, py = sh.p("U2", pin)
+        sh.wire(px, py, px, py - 13)
+        if pin == "+12V_CTRL":
+            sh.glabel(px, py - 13, "+12V_F28_DRIVE", 90)
         else:
-            sh.glabel(px, CB_Y - 55, sig, 90)
+            sh.glabel(px, py - 13, pin, 90)
 
     # Bottom
-    sh.wire(CB_X - 10, CB_Y + 42, CB_X - 10, CB_Y + 52)
-    sh.glabel(CB_X - 10, CB_Y + 52, "GND", 270, "input")
-    sh.wire(CB_X + 10, CB_Y + 42, CB_X + 10, CB_Y + 52)
-    sh.glabel(CB_X + 10, CB_Y + 52, "DIAG_CB", 270)
+    cb_gnd = sh.p("U2", "GND")
+    sh.wire(*cb_gnd, cb_gnd[0], cb_gnd[1] + 10)
+    sh.glabel(cb_gnd[0], cb_gnd[1] + 10, "GND", 270, "input")
+    cb_diag = sh.p("U2", "DIAG")
+    sh.wire(*cb_diag, cb_diag[0], cb_diag[1] + 10)
+    sh.glabel(cb_diag[0], cb_diag[1] + 10, "DIAG_CB", 270)
 
     # -- HV Distribution box detail --
-    hvd_l = ["+114V_BATT", "-114V_BATT"]
-    sp_hvl = 40 / 3
-    for i, sig in enumerate(hvd_l):
-        py = HVD_Y - 20 + sp_hvl * (i + 1)
-        sh.wire(HVD_X - 22, py, HVD_X - 35, py)
-        sh.glabel(HVD_X - 35, py, "+114V" if "+" in sig else "-114V", 180)
+    for pin, sig in [("+114V_BATT", "+114V"), ("-114V_BATT", "-114V")]:
+        px, py = sh.p("U3", pin)
+        sh.wire(px, py, px - 13, py)
+        sh.glabel(px - 13, py, sig, 180)
 
-    hvd_r = ["VA_CB+", "VB_CB-", "VD_DCDC+", "VD_DCDC-", "VQ_CHG+", "VQ_CHG-"]
-    sp_hvr = 40 / 7
-    for i, sig in enumerate(hvd_r):
-        py = HVD_Y - 20 + sp_hvr * (i + 1)
-        sh.wire(HVD_X + 22, py, HVD_X + 35, py)
-        sh.label(HVD_X + 35, py, sig)
+    hvd_r_pins = ["VA_CB+", "VB_CB-", "VD_DCDC+", "VD_DCDC-", "VQ_CHG+", "VQ_CHG-"]
+    for pin in hvd_r_pins:
+        px, py = sh.p("U3", pin)
+        sh.wire(px, py, px + 13, py)
+        sh.label(px + 13, py, pin)
+
+    # HV Dist top pins
+    for pin in ["VH_HEAT", "VK_CTRL"]:
+        px, py = sh.p("U3", pin)
+        sh.wire(px, py, px, py - 10)
+        sh.label(px, py - 10, pin)
 
     # -- Annotations --
     sh.text(30, 260, "SAFETY SYSTEMS & HV DETAIL", 1.8)
