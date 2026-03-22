@@ -231,7 +231,7 @@ class Sheet:
         x, y = self._g(x), self._g(y)
         self.elems.append(
             f'  (label "{name}" (at {x:.3f} {y:.3f} {ang})\n'
-            f'    (effects (font (size 1.27 1.27)))\n'
+            f'    (effects (font (size 1.27 1.27)) (justify left))\n'
             f'    (uuid "{self.uid()}")\n'
             f'  )'
         )
@@ -242,7 +242,7 @@ class Sheet:
         u = self.uid()
         self.elems.append(
             f'  (global_label "{name}" (shape {shape}) (at {x:.3f} {y:.3f} {ang})\n'
-            f'    (effects (font (size 1.27 1.27)))\n'
+            f'    (effects (font (size 1.27 1.27)) (justify left))\n'
             f'    (uuid "{u}")\n'
             f'    (property "Intersheetrefs" "${{INTERSHEET_REFS}}" (at {x:.3f} {y:.3f} 0)\n'
             f'      (effects (font (size 1.27 1.27)) hide)\n'
