@@ -44,6 +44,8 @@ class Sheet:
         self._sym_local_pins = {}  # lib_id -> {pin_name: (local_x, local_y)}
         self._sym_dims = {}       # lib_id -> (w, h)
         self._placements = {}     # ref -> (lib_id, x, y, ang)
+        self._glabel_positions = {}  # name -> [(x, y, ang), ...]
+        self.sheet_num = None     # set externally for cross-ref
 
     # -- UID helper --------------------------------------------------------
     @staticmethod
@@ -247,6 +249,8 @@ class Sheet:
             f'    )\n'
             f'  )'
         )
+        # Track for cross-reference annotations
+        self._glabel_positions.setdefault(name, []).append((x, y, ang))
 
     # -- Power port (standard KiCad power symbols) -------------------------
     def power_flag(self, x, y, name, ang=0):
@@ -278,6 +282,29 @@ class Sheet:
             f'    (uuid "{self.uid()}")\n'
             f'  )'
         )
+
+    # -- Cross-reference annotations ---------------------------------------
+    def add_crossrefs(self, net_to_sheets):
+        """Add small text annotations next to each global label showing
+        which other sheets share the same net.
+        net_to_sheets: {net_name: [sheet_num, ...]}"""
+        for net_name, positions in self._glabel_positions.items():
+            other = sorted(s for s in net_to_sheets.get(net_name, [])
+                           if s != self.sheet_num)
+            if not other:
+                continue
+            ref_str = "→S" + ",S".join(f"{s:02d}" for s in other)
+            for x, y, ang in positions:
+                # Place text near the label, offset to avoid overlap
+                if ang == 0:      # label points right → text below-right
+                    tx, ty = x + 3, y + 2.5
+                elif ang == 180:  # label points left → text below-left
+                    tx, ty = x - 3, y + 2.5
+                elif ang == 90:   # label points up → text to the right
+                    tx, ty = x + 3, y - 2
+                else:             # 270 label points down → text to the right
+                    tx, ty = x + 3, y + 2
+                self.text(tx, ty, ref_str, size=0.8)
 
     # -- Hierarchical sheet block (root sheet only) ------------------------
     def add_hier_sheet(self, sx, sy, sw, sh, sheet_name, sheet_file):
@@ -2721,30 +2748,48 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
     builders = [
-        ("think_s01_power_dist.kicad_sch",   build_s01_power_dist),
-        ("think_s02_hv_power.kicad_sch",     build_s02_hv_power),
-        ("think_s03_motor_ctrl.kicad_sch",    build_s03_motor_ctrl),
-        ("think_s04_sensors.kicad_sch",       build_s04_sensors),
-        ("think_s05_regen_dcdc.kicad_sch",    build_s05_regen_dcdc),
-        ("think_s06_bms_charger.kicad_sch",   build_s06_bms_charger),
-        ("think_s07_headlights.kicad_sch",    build_s07_headlights),
-        ("think_s08_rear_lights.kicad_sch",   build_s08_rear_lights),
-        ("think_s09_signals_horn.kicad_sch",  build_s09_signals_horn),
-        ("think_s10_wipers_alarm.kicad_sch",  build_s10_wipers_alarm),
-        ("think_s11_diag_speed.kicad_sch",    build_s11_diag_speed),
-        ("think_s12_radio_hvac.kicad_sch",    build_s12_radio_hvac),
-        ("think_s13_safety_hv.kicad_sch",     build_s13_safety_hv),
+        (1,  "think_s01_power_dist.kicad_sch",   build_s01_power_dist),
+        (2,  "think_s02_hv_power.kicad_sch",     build_s02_hv_power),
+        (3,  "think_s03_motor_ctrl.kicad_sch",    build_s03_motor_ctrl),
+        (4,  "think_s04_sensors.kicad_sch",       build_s04_sensors),
+        (5,  "think_s05_regen_dcdc.kicad_sch",    build_s05_regen_dcdc),
+        (6,  "think_s06_bms_charger.kicad_sch",   build_s06_bms_charger),
+        (7,  "think_s07_headlights.kicad_sch",    build_s07_headlights),
+        (8,  "think_s08_rear_lights.kicad_sch",   build_s08_rear_lights),
+        (9,  "think_s09_signals_horn.kicad_sch",  build_s09_signals_horn),
+        (10, "think_s10_wipers_alarm.kicad_sch",  build_s10_wipers_alarm),
+        (11, "think_s11_diag_speed.kicad_sch",    build_s11_diag_speed),
+        (12, "think_s12_radio_hvac.kicad_sch",    build_s12_radio_hvac),
+        (13, "think_s13_safety_hv.kicad_sch",     build_s13_safety_hv),
     ]
 
+    # -- Pass 1: build all sheets --
     print("Generating sub-sheets...")
-    for fname, builder in builders:
+    sheets = []
+    for snum, fname, builder in builders:
         sheet = builder()
+        sheet.sheet_num = snum
+        sheets.append((snum, fname, sheet))
+
+    # -- Collect cross-references: net_name → [sheet_nums] --
+    net_to_sheets = {}
+    for snum, _fname, sheet in sheets:
+        for net_name in sheet._glabel_positions:
+            net_to_sheets.setdefault(net_name, []).append(snum)
+
+    # -- Pass 2: add cross-ref annotations and save --
+    for snum, fname, sheet in sheets:
+        sheet.add_crossrefs(net_to_sheets)
         sheet.save(os.path.join(OUT_DIR, fname))
 
     print()
     print("Generating root sheet...")
     root = build_root()
     root.save(os.path.join(OUT_DIR, "think_city_complete.kicad_sch"))
+
+    # Print cross-reference summary
+    multi = {k: v for k, v in net_to_sheets.items() if len(v) > 1}
+    print(f"\nCross-sheet nets: {len(multi)} nets shared across sheets")
 
     print()
     print("=" * 70)
