@@ -18,6 +18,9 @@ import math
 # ---------------------------------------------------------------------------
 OUT_DIR = "/home/hw/Projects/Trabbi-schematic/Data/Trabbi Schematic"
 
+# Grid size for snapping all coordinates (1.27mm = 50mil, KiCad standard)
+GRID = 1.27
+
 # ---------------------------------------------------------------------------
 # Sheet class – encapsulates all builder methods for one .kicad_sch file
 # ---------------------------------------------------------------------------
@@ -115,6 +118,8 @@ class Sheet:
                     px, py, ang = pos, hh + pl, 270
                 else:
                     px, py, ang = pos, -hh - pl, 90
+                px = round(px / GRID) * GRID
+                py = round(py / GRID) * GRID
                 s.append(self._pin_line(pname, n[0], ptype, px, py, ang, pl))
                 pin_map[pname] = str(n[0])
                 pin_local[pname] = (px, py)
@@ -134,6 +139,7 @@ class Sheet:
 
     # -- Place component instance ------------------------------------------
     def place(self, lib_id, ref, val, x, y, ang=0):
+        x, y = self._g(x), self._g(y)
         self._placements[ref] = (lib_id, x, y, ang)
         pm = self.sym_defs.get(lib_id, {})
         s = []
@@ -155,26 +161,35 @@ class Sheet:
         s.append(f'  )')
         self.elems.extend(s)
 
+    # -- Grid snap helper ---------------------------------------------------
+    @staticmethod
+    def _g(val):
+        """Snap a coordinate to the nearest 1.27mm grid point."""
+        return round(val / GRID) * GRID
+
     # -- Pin position lookup ------------------------------------------------
     def p(self, ref, pin_name):
-        """Return exact schematic (x, y) of the connection point of a pin."""
+        """Return exact schematic (x, y) of the connection point of a pin,
+        snapped to the 1.27mm grid."""
         lib_id, sx, sy, ang = self._placements[ref]
         lx, ly = self._sym_local_pins[lib_id][pin_name]
         if ang == 0:
-            return (sx + lx, sy - ly)
+            rx, ry = sx + lx, sy - ly
         elif ang == 90:
-            return (sx - ly, sy - lx)
+            rx, ry = sx - ly, sy - lx
         elif ang == 180:
-            return (sx - lx, sy + ly)
+            rx, ry = sx - lx, sy + ly
         elif ang == 270:
-            return (sx + ly, sy + lx)
+            rx, ry = sx + ly, sy + lx
         else:
             rad = math.radians(ang)
             c, s = math.cos(rad), math.sin(rad)
-            return (sx + lx * c - ly * s, sy - lx * s - ly * c)
+            rx, ry = sx + lx * c - ly * s, sy - lx * s - ly * c
+        return (self._g(rx), self._g(ry))
 
     # -- Wire --------------------------------------------------------------
     def wire(self, x1, y1, x2, y2):
+        x1, y1, x2, y2 = self._g(x1), self._g(y1), self._g(x2), self._g(y2)
         self.elems.append(
             f'  (wire (pts (xy {x1:.3f} {y1:.3f}) (xy {x2:.3f} {y2:.3f}))\n'
             f'    (stroke (width 0) (type default))\n'
@@ -182,8 +197,25 @@ class Sheet:
             f'  )'
         )
 
+    # -- Orthogonal L-shaped wire ------------------------------------------
+    def wire_l(self, x1, y1, x2, y2, h_first=True):
+        """Connect two points with an L-shaped route (no diagonals).
+        h_first=True: horizontal first then vertical.
+        h_first=False: vertical first then horizontal."""
+        x1, y1, x2, y2 = self._g(x1), self._g(y1), self._g(x2), self._g(y2)
+        if x1 == x2 or y1 == y2:
+            # Already orthogonal, single segment
+            self.wire(x1, y1, x2, y2)
+        elif h_first:
+            self.wire(x1, y1, x2, y1)  # horizontal
+            self.wire(x2, y1, x2, y2)  # vertical
+        else:
+            self.wire(x1, y1, x1, y2)  # vertical
+            self.wire(x1, y2, x2, y2)  # horizontal
+
     # -- Net label (local to sheet) ----------------------------------------
     def label(self, x, y, name, ang=0):
+        x, y = self._g(x), self._g(y)
         self.elems.append(
             f'  (label "{name}" (at {x:.3f} {y:.3f} {ang})\n'
             f'    (effects (font (size 1.27 1.27)))\n'
@@ -193,6 +225,7 @@ class Sheet:
 
     # -- Global label (cross-sheet connection) -----------------------------
     def glabel(self, x, y, name, ang=0, shape="bidirectional"):
+        x, y = self._g(x), self._g(y)
         u = self.uid()
         self.elems.append(
             f'  (global_label "{name}" (shape {shape}) (at {x:.3f} {y:.3f} {ang})\n'
@@ -212,6 +245,7 @@ class Sheet:
 
     # -- Junction ----------------------------------------------------------
     def junction(self, x, y):
+        x, y = self._g(x), self._g(y)
         self.elems.append(
             f'  (junction (at {x:.3f} {y:.3f}) (diameter 0) (color 0 0 0 0)'
             f' (uuid "{self.uid()}"))'
@@ -219,6 +253,7 @@ class Sheet:
 
     # -- No-connect --------------------------------------------------------
     def no_connect(self, x, y):
+        x, y = self._g(x), self._g(y)
         self.elems.append(
             f'  (no_connect (at {x:.3f} {y:.3f}) (uuid "{self.uid()}"))'
         )
@@ -621,8 +656,8 @@ def build_s02_hv_power():
     cb_nout = sh.p("U1", "-114V_OUT")
     mc_pv = sh.p("U2", "+114V")
     mc_nv = sh.p("U2", "-114V")
-    sh.wire(*cb_pout, *mc_pv)
-    sh.wire(*cb_nout, *mc_nv)
+    sh.wire_l(*cb_pout, *mc_pv)
+    sh.wire_l(*cb_nout, *mc_nv)
     sh.label(cb_pout[0] + 3, cb_pout[1], "+114V_TO_MC")
     sh.label(cb_nout[0] + 3, cb_nout[1], "-114V_TO_MC")
 
@@ -631,7 +666,7 @@ def build_s02_hv_power():
         mcx, mcy = sh.p("U2", lbl)
         mmx, mmy = sh.p("M1", lbl)
         sh.wire(mcx, mcy, mcx + 13, mcy)
-        sh.wire(mcx + 13, mcy, mmx, mmy)
+        sh.wire_l(mcx + 13, mcy, mmx, mmy)
         sh.label(mcx + 3, mcy, lbl)
 
     # Motor PE
@@ -1172,7 +1207,7 @@ def build_s06_bms_charger():
         sh.label(px, py + 11, pin)
         # Connect to temp sensors
         rt_p = sh.p(f"RT{i+1}", "T+")
-        sh.wire(px, py + 11, *rt_p)
+        sh.wire_l(px, py + 11, *rt_p, h_first=False)
 
     # Charger wiring
     # Charger left (AC)
@@ -1202,7 +1237,7 @@ def build_s06_bms_charger():
     # 230V relay → AC connector
     k1_com = sh.p("K1", "30_COM")
     j1_l1 = sh.p("J1", "L1")
-    sh.wire(*k1_com, *j1_l1)
+    sh.wire_l(*k1_com, *j1_l1)
     sh.label(k1_com[0] + 15, k1_com[1], "230V_L1")
 
     # Cooling relay
@@ -1313,13 +1348,13 @@ def build_s07_headlights():
     # Switch → DRL relay coil
     sw_park = sh.p("SW1", "PARK")
     k1_coil_p = sh.p("K1", "86_COIL+")
-    sh.wire(*sw_park, *k1_coil_p)
+    sh.wire_l(*sw_park, *k1_coil_p)
     sh.label(sw_park[0] + 10, sw_park[1] - 2, "PARK_OUT")
 
     # Switch → Park light relay coil
     sw_low = sh.p("SW1", "LOW_BEAM")
     k2_coil_p = sh.p("K2", "86_COIL+")
-    sh.wire(*sw_low, *k2_coil_p)
+    sh.wire_l(*sw_low, *k2_coil_p)
 
     # Switch → Low beam routing
     sw_high = sh.p("SW1", "HIGH_BEAM")
@@ -1336,8 +1371,8 @@ def build_s07_headlights():
     k1_no = sh.p("K1", "87_NO")
     ds1_p = sh.p("DS1", "+")
     ds2_p = sh.p("DS2", "+")
-    sh.wire(*k1_com, *ds1_p)
-    sh.wire(*k1_no, *ds2_p)
+    sh.wire_l(*k1_com, *ds1_p)
+    sh.wire_l(*k1_no, *ds2_p)
 
     # Park light relay → park/rear
     k2_com = sh.p("K2", "30_COM")
@@ -1475,7 +1510,7 @@ def build_s08_rear_lights():
     k1_no = sh.p("K1", "87_NO")
     ds1_p = sh.p("DS1", "+")
     ds2_p = sh.p("DS2", "+")
-    sh.wire(*k1_com, *ds1_p)
+    sh.wire_l(*k1_com, *ds1_p)
     sh.wire(*k1_no, 200, k1_no[1])
     sh.wire(200, k1_no[1], 200, ds2_p[1])
     sh.wire(200, ds2_p[1], *ds2_p)
@@ -1494,7 +1529,8 @@ def build_s08_rear_lights():
     sh.wire(*sw1_out, 150, sw1_out[1])
     sh.wire(150, sw1_out[1], 150, ds3_p[1])
     sh.wire(150, ds3_p[1], *ds3_p)
-    sh.wire(150, sw1_out[1], *ds4_p)
+    sh.wire(150, sw1_out[1], 150, ds4_p[1])
+    sh.wire(150, ds4_p[1], *ds4_p)
     sh.wire(150, sw1_out[1], 150, ds5_p[1])
     sh.wire(150, ds5_p[1], *ds5_p)
     sh.junction(150, sw1_out[1])
@@ -1816,21 +1852,21 @@ def build_s10_wipers_alarm():
     # Wiper switch INTERVAL → relay coil
     wsw_intv = sh.p("SW1", "INTERVAL")
     k1_cp = sh.p("K1", "86_COIL+")
-    sh.wire(*wsw_intv, *k1_cp)
+    sh.wire_l(*wsw_intv, *k1_cp)
 
     # Wiper relay → motor PARK/SLOW
     k1_com = sh.p("K1", "30_COM")
     k1_no = sh.p("K1", "87_NO")
     wm_park = sh.p("M1", "PARK")
     wm_slow = sh.p("M1", "SLOW")
-    sh.wire(*k1_com, *wm_park)
-    sh.wire(*k1_no, *wm_slow)
+    sh.wire_l(*k1_com, *wm_park)
+    sh.wire_l(*k1_no, *wm_slow)
 
     # Wiper motor fast speed
     wsw_fast = sh.p("SW1", "FAST")
     wm_fast = sh.p("M1", "FAST")
     sh.wire(*wsw_fast, 200, wsw_fast[1])
-    sh.wire(200, wsw_fast[1], *wm_fast)
+    sh.wire_l(200, wsw_fast[1], *wm_fast)
 
     # Wiper motor right side
     wm_com = sh.p("M1", "COM")
@@ -2152,7 +2188,7 @@ def build_s12_radio_hvac():
         rx, ry = sh.p("U1", rpin)
         spin = "+" if "+" in rpin else "-"
         sx, sy = sh.p(sref, spin)
-        sh.wire(rx, ry, sx, sy)
+        sh.wire_l(rx, ry, sx, sy)
 
     # Speaker GND
     for ref in ["LS1", "LS2"]:
@@ -2174,7 +2210,7 @@ def build_s12_radio_hvac():
     sh.text(k1_cp[0] - 12, k1_cp[1] - 4, "From F1 (30A)", 0.9)
     k1_com = sh.p("K1", "30_COM")
     hr_12v = sh.p("HR1", "+12V")
-    sh.wire(*k1_com, *hr_12v)
+    sh.wire_l(*k1_com, *hr_12v)
     hr_gnd = sh.p("HR1", "GND")
     sh.wire(*hr_gnd, hr_gnd[0] + 12, hr_gnd[1])
     sh.glabel(hr_gnd[0] + 12, hr_gnd[1], "GND", 0, "input")
@@ -2196,10 +2232,10 @@ def build_s12_radio_hvac():
 
     hs_spd1 = sh.p("SW1", "SPD1")
     k2_cp = sh.p("K2", "86_COIL+")
-    sh.wire(*hs_spd1, *k2_cp)
+    sh.wire_l(*hs_spd1, *k2_cp)
     k2_com = sh.p("K2", "30_COM")
     bm_mp = sh.p("M2", "M+")
-    sh.wire(*k2_com, *bm_mp)
+    sh.wire_l(*k2_com, *bm_mp)
 
     # Blower GND
     bm_mn = sh.p("M2", "M-")
@@ -2212,10 +2248,10 @@ def build_s12_radio_hvac():
     sh.glabel(sw2_a[0] - 16, sw2_a[1], "+12V_F5_BLOWER", 180)
     sw2_b = sh.p("SW2", "B")
     k3_cp = sh.p("K3", "86_COIL+")
-    sh.wire(*sw2_b, *k3_cp)
+    sh.wire_l(*sw2_b, *k3_cp)
     k3_com = sh.p("K3", "30_COM")
     rm_p = sh.p("M3", "M+")
-    sh.wire(*k3_com, *rm_p)
+    sh.wire_l(*k3_com, *rm_p)
     rm_n = sh.p("M3", "M-")
     sh.wire(*rm_n, rm_n[0] + 12, rm_n[1])
     sh.glabel(rm_n[0] + 12, rm_n[1], "GND", 0, "input")
@@ -2343,10 +2379,10 @@ def build_s13_safety_hv():
         sh.wire(px, py, px + 13, py)
         if pin == "DRIVER_BELT":
             sb1_f = sh.p("SB1", "FIRE+")
-            sh.wire(px + 13, py, *sb1_f)
+            sh.wire_l(px + 13, py, *sb1_f)
         elif pin == "PASS_BELT":
             sb2_f = sh.p("SB2", "FIRE+")
-            sh.wire(px + 13, py, *sb2_f)
+            sh.wire_l(px + 13, py, *sb2_f)
         elif pin == "GND":
             sh.glabel(px + 13, py, "GND", 0, "input")
         else:
